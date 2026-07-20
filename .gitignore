@@ -1,0 +1,16 @@
+# Environment files
+.env
+.env.*
+
+# OpenStreetMap datasets
+data/osm/*
+!data/osm/.gitkeep
+
+# Local logs
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

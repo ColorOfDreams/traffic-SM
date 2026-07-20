@@ -1,0 +1,67 @@
+name: traffic-system
+
+services:
+  tile38:
+    build:
+      context: ./services/tile38
+      dockerfile: Dockerfile
+    image: traffic-tile38:dev
+    ports:
+      - "9851:9851"
+    volumes:
+      - tile38-data:/data
+    networks:
+      - traffic-network
+    restart: unless-stopped
+
+  graphhopper:
+    build:
+      context: ./services/graphhopper
+      dockerfile: Dockerfile
+    image: traffic-graphhopper:dev
+    ports:
+      - "8989:8989"
+    volumes:
+      - ./data/osm:/data/osm:ro
+      - graphhopper-cache:/data/graph-cache
+    command:
+      - java
+      - -Ddw.graphhopper.datareader.file=/data/osm/hanoi-test.osm
+      - -Ddw.graphhopper.graph.location=/data/graph-cache
+      - -Ddw.server.application_connectors[0].bind_host=0.0.0.0
+      - -Ddw.server.admin_connectors[0].bind_host=0.0.0.0
+      - -jar
+      - /app/graphhopper-web.jar
+      - server
+      - /app/config.yml
+    networks:
+      - traffic-network
+    restart: unless-stopped
+
+  location-service:
+    build:
+      context: ./services/location-service
+      dockerfile: Dockerfile
+    image: traffic-location-service:dev
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      TILE38_ADDRESS: "tile38:9851"
+      GRAPHHOPPER_URL: "http://graphhopper:8989"
+    depends_on:
+      tile38:
+        condition: service_healthy
+      graphhopper:
+        condition: service_healthy
+    networks:
+      - traffic-network
+    restart: unless-stopped
+
+networks:
+  traffic-network:
+    driver: bridge
+
+volumes:
+  tile38-data:
+  graphhopper-cache:
