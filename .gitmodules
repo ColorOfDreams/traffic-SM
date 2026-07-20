@@ -1,0 +1,3 @@
+[submodule "services/graphhopper"]
+	path = services/graphhopper
+	url = https://github.com/ColorOfDreams/graphhopper.git
