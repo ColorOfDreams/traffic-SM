@@ -23,17 +23,14 @@ services:
       - "8989:8989"
     volumes:
       - ./data/osm:/data/osm:ro
+      - ./services/graphhopper/config/config.yml:/app/config/config.yml:ro
       - graphhopper-cache:/data/graph-cache
-    command:
-      - java
-      - -Ddw.graphhopper.datareader.file=/data/osm/hanoi-test.osm
-      - -Ddw.graphhopper.graph.location=/data/graph-cache
-      - -Ddw.server.application_connectors[0].bind_host=0.0.0.0
-      - -Ddw.server.admin_connectors[0].bind_host=0.0.0.0
-      - -jar
-      - /app/graphhopper-web.jar
-      - server
-      - /app/config.yml
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
     networks:
       - traffic-network
     restart: unless-stopped
@@ -54,6 +51,11 @@ services:
         condition: service_healthy
       graphhopper:
         condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
     networks:
       - traffic-network
     restart: unless-stopped
