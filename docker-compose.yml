@@ -21,10 +21,12 @@ services:
     image: traffic-graphhopper:dev
     ports:
       - "8989:8989"
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms1g -Xmx5g"
     volumes:
       - ./data/osm:/data/osm:ro
       - ./services/graphhopper/config/config.yml:/app/config/config.yml:ro
-      - graphhopper-cache:/data/graph-cache
+      - graphhopper-cache-vietnam-20260722:/data/graph-cache
     cap_drop:
       - ALL
     security_opt:
@@ -46,6 +48,7 @@ services:
       PORT: "8080"
       TILE38_ADDRESS: "tile38:9851"
       GRAPHHOPPER_URL: "http://graphhopper:8989"
+      GPS_EDGE_COLLECTIONS: "hanoi_graph_edges_vietnam_20260722,hochiminh_graph_edges_vietnam_20260722"
     depends_on:
       tile38:
         condition: service_healthy
@@ -67,3 +70,4 @@ networks:
 volumes:
   tile38-data:
   graphhopper-cache:
+  graphhopper-cache-vietnam-20260722:
