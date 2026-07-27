@@ -1,5 +1,3 @@
-// Hiểu gps nó là gig
-// Check xem dữ liệu gps có hợp lệ không
 package gps
 
 import (
@@ -9,38 +7,42 @@ import (
 	"io"
 	"math"
 	"strings"
-	"time"
 )
 
-// Dữ liệu đã qua validation và chuẩn hóa, sẵn sàng để encode thành JSON response
+// CanonicalEvent là payload GPS tối thiểu được ghi vào Kafka.
+// DriverID đồng thời được dùng làm Kafka message key để giữ thứ tự theo tài xế.
+// SpeedMPS, HeadingDeg và AccuracyM dùng -1 khi thiết bị không cung cấp giá trị.
+// Phiên bản chính thức nhận được
 type CanonicalEvent struct {
-	EventID    string   `json:"event_id"`
-	VehicleID  string   `json:"vehicle_id"`
-	RecordedAt string   `json:"recorded_at"`
-	Longitude  float64  `json:"longitude"`
-	Latitude   float64  `json:"latitude"`
-	SpeedKMH   float64  `json:"speed_kmh"`
-	HeadingDeg *float64 `json:"heading_deg"`
+	EventID      string  `json:"event_id"`
+	DriverID     string  `json:"driver_id"`
+	RecordedAtMS int64   `json:"recorded_at_ms"`
+	Longitude    float64 `json:"longitude"`
+	Latitude     float64 `json:"latitude"`
+	SpeedMPS     float64 `json:"speed_mps"`
+	HeadingDeg   float64 `json:"heading_deg"`
+	AccuracyM    float64 `json:"accuracy_m"`
 }
 
-// Đại diện dữ liệu vừa đọc trong JSON
+// Struct trung gian để phát hiện field bị thiếu
 type requestPayload struct {
-	EventID    string          `json:"event_id"`
-	VehicleID  string          `json:"vehicle_id"`
-	RecordedAt string          `json:"recorded_at"`
-	Longitude  *float64        `json:"longitude"`
-	Latitude   *float64        `json:"latitude"`
-	SpeedKMH   *float64        `json:"speed_kmh"`
-	HeadingDeg json.RawMessage `json:"heading_deg"`
+	EventID      string   `json:"event_id"`
+	DriverID     string   `json:"driver_id"`
+	RecordedAtMS *int64   `json:"recorded_at_ms"`
+	Longitude    *float64 `json:"longitude"`
+	Latitude     *float64 `json:"latitude"`
+	SpeedMPS     *float64 `json:"speed_mps"`
+	HeadingDeg   *float64 `json:"heading_deg"`
+	AccuracyM    *float64 `json:"accuracy_m"`
 }
 
-// JSON request đi vào requestPayload tạm, sau validation được chuyển thành CanonicalEvent.
-// HTTP handler encode CanonicalEvent thành JSON response.
-
+// Decode chuyển sang chuẩn file caniconal và validate dữ liệu
+// Input nhận vào là 1 lần nhận dữ liệu
 func DecodeCanonicalEvent(input io.Reader) (CanonicalEvent, error) {
+	// Khai báo con trỏ
 	decoder := json.NewDecoder(input)
 	decoder.DisallowUnknownFields()
-	// Đọc JSON vào requestPayload, kiểm tra các trường rồi trả về CanonicalEvent đã chuẩn hóa.
+	// Tạo biến request và thực hiện check nếu đúng thì trả về canonical, nếu vấn đề thì trả về lỗi
 	var value requestPayload
 	if err := decoder.Decode(&value); err != nil {
 		return CanonicalEvent{}, fmt.Errorf("decode JSON: %w", err)
@@ -48,19 +50,17 @@ func DecodeCanonicalEvent(input io.Reader) (CanonicalEvent, error) {
 	if err := ensureEnd(decoder); err != nil {
 		return CanonicalEvent{}, err
 	}
-
+	// Validate
 	eventID := strings.TrimSpace(value.EventID)
 	if eventID == "" {
 		return CanonicalEvent{}, errors.New("event_id is required")
 	}
-	vehicleID := strings.TrimSpace(value.VehicleID)
-	if vehicleID == "" {
-		return CanonicalEvent{}, errors.New("vehicle_id is required")
+	driverID := strings.TrimSpace(value.DriverID)
+	if driverID == "" {
+		return CanonicalEvent{}, errors.New("driver_id is required")
 	}
-
-	recordedAt, err := time.Parse(time.RFC3339Nano, value.RecordedAt)
-	if err != nil {
-		return CanonicalEvent{}, errors.New("recorded_at must be an RFC3339 timestamp with timezone")
+	if value.RecordedAtMS == nil || *value.RecordedAtMS <= 0 {
+		return CanonicalEvent{}, errors.New("recorded_at_ms must be a positive Unix timestamp in milliseconds")
 	}
 
 	if value.Longitude == nil || !finite(*value.Longitude) || *value.Longitude < -180 || *value.Longitude > 180 {
@@ -69,23 +69,26 @@ func DecodeCanonicalEvent(input io.Reader) (CanonicalEvent, error) {
 	if value.Latitude == nil || !finite(*value.Latitude) || *value.Latitude < -90 || *value.Latitude > 90 {
 		return CanonicalEvent{}, errors.New("latitude must be a finite number from -90 to 90")
 	}
-	if value.SpeedKMH == nil || !finite(*value.SpeedKMH) || *value.SpeedKMH < 0 {
-		return CanonicalEvent{}, errors.New("speed_kmh must be a finite number greater than or equal to zero")
+	if value.SpeedMPS == nil || !validOptionalNonNegative(*value.SpeedMPS) {
+		return CanonicalEvent{}, errors.New("speed_mps must be -1 or a finite number greater than or equal to zero")
 	}
-
-	heading, err := decodeHeading(value.HeadingDeg)
-	if err != nil {
-		return CanonicalEvent{}, err
+	if value.HeadingDeg == nil || !finite(*value.HeadingDeg) ||
+		(*value.HeadingDeg != -1 && (*value.HeadingDeg < 0 || *value.HeadingDeg >= 360)) {
+		return CanonicalEvent{}, errors.New("heading_deg must be -1 or a finite number from 0 up to but not including 360")
+	}
+	if value.AccuracyM == nil || !validOptionalNonNegative(*value.AccuracyM) {
+		return CanonicalEvent{}, errors.New("accuracy_m must be -1 or a finite number greater than or equal to zero")
 	}
 
 	return CanonicalEvent{
-		EventID:    eventID,
-		VehicleID:  vehicleID,
-		RecordedAt: recordedAt.UTC().Format(time.RFC3339Nano),
-		Longitude:  *value.Longitude,
-		Latitude:   *value.Latitude,
-		SpeedKMH:   *value.SpeedKMH,
-		HeadingDeg: heading,
+		EventID:      eventID,
+		DriverID:     driverID,
+		RecordedAtMS: *value.RecordedAtMS,
+		Longitude:    *value.Longitude,
+		Latitude:     *value.Latitude,
+		SpeedMPS:     *value.SpeedMPS,
+		HeadingDeg:   *value.HeadingDeg,
+		AccuracyM:    *value.AccuracyM,
 	}, nil
 }
 
@@ -101,21 +104,10 @@ func ensureEnd(decoder *json.Decoder) error {
 	return errors.New("request body must contain exactly one JSON object")
 }
 
-func decodeHeading(raw json.RawMessage) (*float64, error) {
-	if len(raw) == 0 {
-		return nil, errors.New("heading_deg is required and may be null")
-	}
-	if string(raw) == "null" {
-		return nil, nil
-	}
-
-	var heading float64
-	if err := json.Unmarshal(raw, &heading); err != nil || !finite(heading) || heading < 0 || heading >= 360 {
-		return nil, errors.New("heading_deg must be null or a finite number from 0 up to but not including 360")
-	}
-	return &heading, nil
-}
-
 func finite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func validOptionalNonNegative(value float64) bool {
+	return finite(value) && (value == -1 || value >= 0)
 }

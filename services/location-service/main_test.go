@@ -24,12 +24,13 @@ func TestGPSEventAccepted(t *testing.T) {
 		"/v1/gps-events",
 		strings.NewReader(`{
 			"event_id":"gps-001",
-			"vehicle_id":"vehicle-001",
-			"recorded_at":"2026-07-23T11:00:05+07:00",
+			"driver_id":"1",
+			"recorded_at_ms":1784872804400,
 			"longitude":105.8542,
 			"latitude":21.0285,
-			"speed_kmh":32.4,
-			"heading_deg":275
+			"speed_mps":9,
+			"heading_deg":275,
+			"accuracy_m":3
 		}`),
 	)
 	request.Header.Set("Content-Type", "application/json")

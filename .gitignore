@@ -2,9 +2,8 @@
 .env
 .env.*
 
-# OpenStreetMap datasets
-data/osm/*
-!data/osm/.gitkeep
+# Local datasets and benchmark results
+/data/
 
 # Local logs
 *.log
