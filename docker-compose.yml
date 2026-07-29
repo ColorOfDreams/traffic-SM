@@ -103,6 +103,7 @@ services:
       TILE38_ADDRESS: "tile38:9851"
       GRAPHHOPPER_URL: "http://graphhopper:8989"
       GRAPHHOPPER_PROFILE: "car"
+      GRAPH_VERSION: "vietnam-20260722"
       GRAPHHOPPER_TIMEOUT: "5s"
       GRAPHHOPPER_GPS_ACCURACY: "10"
       GRAPHHOPPER_WORKERS: "4"

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -20,20 +19,23 @@ import (
 const maxGraphHopperResponseBytes = 4 * 1024 * 1024
 
 type Config struct {
-	BaseURL     string
-	Profile     string
-	GPSAccuracy float64
-	Timeout     time.Duration
-}
-
-type Result struct {
-	ResponseJSON []byte
-	TookMS       int64
+	BaseURL       string
+	Profile       string
+	GraphVersion  string
+	GPSAccuracy   float64
+	Timeout       time.Duration
+	FragmentScope FragmentScope
 }
 
 type Client struct {
-	matchURL   string
-	httpClient *http.Client
+	matchURL      string
+	graphVersion  string
+	httpClient    *http.Client
+	fragmentScope FragmentScope
+}
+
+type FragmentScope interface {
+	Filter(context.Context, []TraversalFragment) ([]TraversalFragment, int, error)
 }
 
 func NewClient(config Config) (*Client, error) {
@@ -44,11 +46,18 @@ func NewClient(config Config) (*Client, error) {
 	if config.Profile == "" {
 		return nil, errors.New("GraphHopper profile is required")
 	}
+	graphVersion := strings.TrimSpace(config.GraphVersion)
+	if graphVersion == "" {
+		return nil, errors.New("GraphHopper graph version is required")
+	}
 	if config.GPSAccuracy <= 0 {
 		return nil, errors.New("GraphHopper GPS accuracy must be positive")
 	}
 	if config.Timeout <= 0 {
 		return nil, errors.New("GraphHopper timeout must be positive")
+	}
+	if config.FragmentScope == nil {
+		return nil, errors.New("traffic fragment scope is required")
 	}
 
 	matchURL, err := url.Parse(baseURL + "/match")
@@ -65,108 +74,68 @@ func NewClient(config Config) (*Client, error) {
 	matchURL.RawQuery = query.Encode()
 
 	return &Client{
-		matchURL: matchURL.String(),
+		matchURL:     matchURL.String(),
+		graphVersion: graphVersion,
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 		},
+		fragmentScope: config.FragmentScope,
 	}, nil
 }
 
-func (client *Client) Match(ctx context.Context, trace gps.Trace) (Result, error) {
+func (client *Client) Match(ctx context.Context, trace gps.Trace) (MatchedTrace, error) {
 	body, err := encodeGPX(trace)
 	if err != nil {
-		return Result{}, err
+		return MatchedTrace{}, err
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.matchURL, bytes.NewReader(body))
 	if err != nil {
-		return Result{}, fmt.Errorf("create GraphHopper request: %w", err)
+		return MatchedTrace{}, fmt.Errorf("create GraphHopper request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/gpx+xml")
 	request.Header.Set("Accept", "application/json")
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return Result{}, fmt.Errorf("call GraphHopper: %w", err)
+		return MatchedTrace{}, fmt.Errorf("call GraphHopper: %w", err)
 	}
 	defer response.Body.Close()
 
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxGraphHopperResponseBytes+1))
 	if err != nil {
-		return Result{}, fmt.Errorf("read GraphHopper response: %w", err)
+		return MatchedTrace{}, fmt.Errorf("read GraphHopper response: %w", err)
 	}
 	if len(responseBody) > maxGraphHopperResponseBytes {
-		return Result{}, errors.New("GraphHopper response exceeds size limit")
+		return MatchedTrace{}, errors.New("GraphHopper response exceeds size limit")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return Result{}, fmt.Errorf(
+		return MatchedTrace{}, fmt.Errorf(
 			"GraphHopper returned HTTP %d: %s",
 			response.StatusCode,
 			strings.TrimSpace(string(responseBody)),
 		)
 	}
 	if !json.Valid(responseBody) {
-		return Result{}, errors.New("GraphHopper returned invalid JSON")
+		return MatchedTrace{}, errors.New("GraphHopper returned invalid JSON")
 	}
 
-	var tookMS int64
-	if value := response.Header.Get("X-GH-Took"); value != "" {
-		tookMS, _ = strconv.ParseInt(value, 10, 64)
-	}
-
-	return Result{
-		ResponseJSON: responseBody,
-		TookMS:       tookMS,
-	}, nil
-}
-
-type gpxDocument struct {
-	XMLName xml.Name `xml:"gpx"`
-	Version string   `xml:"version,attr"`
-	Creator string   `xml:"creator,attr"`
-	XMLNS   string   `xml:"xmlns,attr"`
-	Track   gpxTrack `xml:"trk"`
-}
-
-type gpxTrack struct {
-	Segment gpxSegment `xml:"trkseg"`
-}
-
-type gpxSegment struct {
-	Points []gpxPoint `xml:"trkpt"`
-}
-
-type gpxPoint struct {
-	Latitude  float64 `xml:"lat,attr"`
-	Longitude float64 `xml:"lon,attr"`
-	Time      string  `xml:"time"`
-}
-
-func encodeGPX(trace gps.Trace) ([]byte, error) {
-	if len(trace.Points) < 2 {
-		return nil, errors.New("map matching requires at least two GPS points")
-	}
-
-	points := make([]gpxPoint, len(trace.Points))
-	for index, point := range trace.Points {
-		points[index] = gpxPoint{
-			Latitude:  point.Latitude,
-			Longitude: point.Longitude,
-			Time:      time.UnixMilli(point.RecordedAtMS).UTC().Format(time.RFC3339Nano),
-		}
-	}
-
-	document := gpxDocument{
-		Version: "1.1",
-		Creator: "traffic-location-service",
-		XMLNS:   "http://www.topografix.com/GPX/1/1",
-		Track: gpxTrack{
-			Segment: gpxSegment{Points: points},
-		},
-	}
-	body, err := xml.Marshal(document)
+	matchedTrace, err := adaptGraphHopperResponse(
+		trace,
+		client.graphVersion,
+		time.Now().UTC(),
+		responseBody,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("encode GPX: %w", err)
+		return MatchedTrace{}, err
 	}
-	return append([]byte(xml.Header), body...), nil
+
+	matchedTrace.MatchedFragmentCount = len(matchedTrace.Fragments)
+	filtered, dropped, err := client.fragmentScope.Filter(ctx, matchedTrace.Fragments)
+	if err != nil {
+		return MatchedTrace{}, fmt.Errorf("filter matched fragments by traffic scope: %w", err)
+	}
+	matchedTrace.Fragments = filtered
+	matchedTrace.DroppedFragmentCount = dropped
+	return matchedTrace, nil
 }

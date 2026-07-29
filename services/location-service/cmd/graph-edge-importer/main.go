@@ -36,6 +36,7 @@ var includedRoadClasses = map[string]struct{}{
 var allowedProperties = map[string]struct{}{
 	"graph_version": {},
 	"edge_id":       {},
+	"traversal_key": {},
 	"forward":       {},
 	"osm_way_id":    {},
 	"distance_m":    {},
@@ -206,6 +207,10 @@ func validateFeature(item feature, expectedGraphVersion string) error {
 	if err != nil {
 		return err
 	}
+	traversalKey, err := nonNegativeIntegerProperty(item.Properties, "traversal_key")
+	if err != nil {
+		return err
+	}
 	forward, err := boolProperty(item.Properties, "forward")
 	if err != nil {
 		return err
@@ -216,6 +221,13 @@ func validateFeature(item feature, expectedGraphVersion string) error {
 	}
 	if item.ID != fmt.Sprintf("%s_e%d_%s", graphVersion, edgeID, expectedDirectionSuffix) {
 		return errors.New("feature ID does not match graph version, edge ID, or direction")
+	}
+	expectedTraversalKey := edgeID * 2
+	if !forward {
+		expectedTraversalKey++
+	}
+	if traversalKey != expectedTraversalKey {
+		return errors.New("traversal_key does not match edge_id and direction")
 	}
 
 	if _, err := positiveIntegerProperty(item.Properties, "osm_way_id"); err != nil {
@@ -265,6 +277,7 @@ func importFeature(client *tile38.Client, collection string, item feature) error
 	fieldMappings := [][2]string{
 		{"graph_version", "graph_version"},
 		{"edge_id", "edge_id"},
+		{"traversal_key", "traversal_key"},
 		{"forward", "forward"},
 		{"osm_way_id", "osm_way_id"},
 		{"distance_m", "distance_m"},

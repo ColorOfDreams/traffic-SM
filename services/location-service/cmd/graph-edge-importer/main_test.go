@@ -10,12 +10,15 @@ func TestValidateFeatureDirection(t *testing.T) {
 		name    string
 		id      string
 		forward any
+		key     any
 		wantErr bool
 	}{
-		{name: "forward", id: "v1_e7_f", forward: true},
-		{name: "reverse", id: "v1_e7_r", forward: false},
-		{name: "mismatched suffix", id: "v1_e7_r", forward: true, wantErr: true},
-		{name: "invalid type", id: "v1_e7_f", forward: "true", wantErr: true},
+		{name: "forward", id: "v1_e7_f", forward: true, key: float64(14)},
+		{name: "reverse", id: "v1_e7_r", forward: false, key: float64(15)},
+		{name: "mismatched suffix", id: "v1_e7_r", forward: true, key: float64(14), wantErr: true},
+		{name: "invalid direction type", id: "v1_e7_f", forward: "true", key: float64(14), wantErr: true},
+		{name: "mismatched traversal key", id: "v1_e7_f", forward: true, key: float64(15), wantErr: true},
+		{name: "missing traversal key", id: "v1_e7_f", forward: true, wantErr: true},
 	}
 
 	for _, test := range tests {
@@ -30,6 +33,7 @@ func TestValidateFeatureDirection(t *testing.T) {
 				Properties: map[string]any{
 					"graph_version": "v1",
 					"edge_id":       float64(7),
+					"traversal_key": test.key,
 					"forward":       test.forward,
 					"osm_way_id":    float64(10),
 					"distance_m":    float64(100),

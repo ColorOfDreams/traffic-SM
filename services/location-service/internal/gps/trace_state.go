@@ -13,56 +13,7 @@ var (
 	ErrReceivedAtMissing = errors.New("received_at is required")
 )
 
-type Trace struct {
-	TraceID   string           `json:"trace_id"`
-	DriverID  string           `json:"driver_id"`
-	StartedAt time.Time        `json:"started_at"`
-	EndedAt   time.Time        `json:"ended_at"`
-	Points    []CanonicalEvent `json:"points"`
-}
-
-type ConsumerStateConfig struct {
-	TracePoints        int
-	OverlapPoints      int
-	MaxPointGap        time.Duration
-	InactivityTimeout  time.Duration
-	MaxBufferedPoints  int
-	MaxMatchAttempts   int
-	MinDisplacementM   float64
-	MaxImpliedSpeedMPS float64
-}
-
-type inFlightMatch struct {
-	trace    Trace
-	attempts int
-}
-
-type DriverState struct {
-	// Points chỉ chứa overlap và các GPS đang chờ trace tiếp theo.
-	// Các điểm GraphHopper đang xử lý nằm riêng trong inFlight.
-	Points           []CanonicalEvent
-	LastEventID      string
-	LastRecordedAtMS int64
-	LastLongitude    float64
-	LastLatitude     float64
-	LastSeenAt       time.Time
-	inFlight         *inFlightMatch
-}
-
-type ConsumerState struct {
-	config  ConsumerStateConfig
-	drivers map[string]*DriverState
-}
-
-// MatchCompletion mô tả công việc tiếp theo sau khi GraphHopper trả kết quả.
-// RetryTrace và NextTrace loại trừ lẫn nhau. FailedTrace cần được ghi log hoặc
-// đưa vào dead-letter topic khi đã dùng hết số lần thử.
-type MatchCompletion struct {
-	RetryTrace  *Trace
-	NextTrace   *Trace
-	FailedTrace *Trace
-}
-
+// NewConsumerState kiểm tra config và tạo state rỗng cho một Kafka partition.
 func NewConsumerState(config ConsumerStateConfig) (*ConsumerState, error) {
 	if config.TracePoints < 2 {
 		return nil, errors.New("trace points must be at least two")
@@ -107,13 +58,26 @@ func NewConsumerState(config ConsumerStateConfig) (*ConsumerState, error) {
 	}, nil
 }
 
-// Add phải được gọi bởi goroutine sở hữu Kafka partition. CompleteMatch và
-// EvictInactive của cùng ConsumerState cũng phải chạy trên chính goroutine đó.
+// Add nhận một GPS đã validate, cập nhật state của tài xế và trả về Trace khi
+// buffer đã đủ điểm và đạt độ dịch chuyển tối thiểu. Kết quả nil nghĩa là state
+// đã nhận GPS nhưng chưa có trace sẵn sàng.
+//
+// Add, CompleteMatch và EvictInactive của cùng ConsumerState phải chạy tuần tự
+// trên goroutine sở hữu Kafka partition.
 func (state *ConsumerState) Add(event CanonicalEvent, receivedAt time.Time) (*Trace, error) {
 	if receivedAt.IsZero() {
 		return nil, ErrReceivedAtMissing
 	}
 	receivedAt = receivedAt.UTC()
+
+	recordedAt, err := event.RecordedAt()
+	if err != nil {
+		return nil, fmt.Errorf("derive GPS time: %w", err)
+	}
+	eventKey, err := eventFingerprint(event)
+	if err != nil {
+		return nil, err
+	}
 
 	driver := state.drivers[event.DriverID]
 	if driver == nil {
@@ -124,55 +88,57 @@ func (state *ConsumerState) Add(event CanonicalEvent, receivedAt time.Time) (*Tr
 	}
 
 	// Kafka at-least-once thường phát lại message ngay sát message gốc.
-	if event.EventID == driver.LastEventID {
+	if eventKey == driver.LastEventKey {
 		return nil, nil
 	}
 
-	if driver.LastRecordedAtMS > 0 {
-		// driver_id là Kafka key nên event hợp lệ phải đến đúng thứ tự.
-		if event.RecordedAtMS <= driver.LastRecordedAtMS {
+	if !driver.LastRecordedAt.IsZero() {
+		// DriverID là Kafka key nên event hợp lệ phải đến đúng thứ tự.
+		if !recordedAt.After(driver.LastRecordedAt) {
 			return nil, nil
 		}
 
-		elapsedMS := event.RecordedAtMS - driver.LastRecordedAtMS
-		gap := time.Duration(elapsedMS) * time.Millisecond
+		gap := recordedAt.Sub(driver.LastRecordedAt)
 		if state.config.MaxPointGap > 0 && gap > state.config.MaxPointGap {
 			// Chỉ bỏ overlap/pending của hành trình cũ. Trace đang chạy được giữ
-			// riêng trong inFlight nên kết quả cũ không thể xóa GPS hành trình mới.
+			// riêng trong inFlight nên không xóa nhầm GPS của hành trình mới.
 			driver.Points = driver.Points[:0]
 		} else if state.config.MaxImpliedSpeedMPS > 0 {
 			distanceM := haversineMeters(
-				driver.LastLatitude,
-				driver.LastLongitude,
-				event.Latitude,
-				event.Longitude,
+				driver.LastLat,
+				driver.LastLng,
+				event.Lat,
+				event.Lng,
 			)
-			impliedSpeedMPS := distanceM / (float64(elapsedMS) / 1000)
+			impliedSpeedMPS := distanceM / gap.Seconds()
 			if impliedSpeedMPS > state.config.MaxImpliedSpeedMPS {
-				// Thiết bị vừa teleport hoặc đổi khu vực hoạt động. Không đưa hai
-				// hành trình cách xa nhau vào cùng một yêu cầu GraphHopper.
+				// Điểm GPS có bước nhảy bất thường; không đưa hai hành trình cách
+				// xa nhau vào cùng một yêu cầu GraphHopper.
 				driver.Points = driver.Points[:0]
 			}
 		}
 	}
 
 	if len(driver.Points) >= state.config.MaxBufferedPoints {
-		// Consumer phải pause partition hoặc ngừng poll/commit để tạo backpressure.
+		// Caller phải tạo backpressure thay vì tiếp tục tăng bộ nhớ vô hạn.
 		return nil, ErrDriverBufferFull
 	}
 
 	driver.Points = append(driver.Points, event)
-	driver.LastEventID = event.EventID
-	driver.LastRecordedAtMS = event.RecordedAtMS
-	driver.LastLongitude = event.Longitude
-	driver.LastLatitude = event.Latitude
+	driver.LastEventKey = eventKey
+	driver.LastRecordedAt = recordedAt
+	driver.LastLng = event.Lng
+	driver.LastLat = event.Lat
 	driver.LastSeenAt = receivedAt
 
-	trace := state.startTrace(event.DriverID, driver)
+	trace, err := state.startTrace(event.DriverID, driver)
+	if err != nil {
+		return nil, err
+	}
 	if trace == nil &&
 		driver.inFlight == nil &&
 		len(driver.Points) >= state.config.TracePoints {
-		// Xe đứng yên: dùng cửa sổ trượt thay vì tích lũy vô hạn hoặc gửi một
+		// Xe đứng yên: giữ cửa sổ trượt thay vì tích lũy vô hạn hoặc gửi một
 		// trace không có chuyển động cho GraphHopper.
 		keep := state.config.TracePoints - 1
 		driver.Points = append([]CanonicalEvent(nil), driver.Points[len(driver.Points)-keep:]...)
@@ -180,8 +146,8 @@ func (state *ConsumerState) Add(event CanonicalEvent, receivedAt time.Time) (*Tr
 	return trace, nil
 }
 
-// CompleteMatch chỉ thay đổi state khi driver_id và trace_id cùng khớp với
-// trace đang chạy. Nhờ vậy kết quả trùng hoặc kết quả cũ không xóa nhầm GPS.
+// CompleteMatch hoàn tất trace đang xử lý nếu driverID và traceID cùng khớp.
+// Kết quả trùng hoặc cũ không được phép làm thay đổi state hiện tại.
 func (state *ConsumerState) CompleteMatch(
 	driverID string,
 	traceID string,
@@ -203,20 +169,25 @@ func (state *ConsumerState) CompleteMatch(
 		driver.inFlight = nil
 		state.dropFailedOverlap(driver, failed)
 
-		return MatchCompletion{
-			FailedTrace: &failed,
-			NextTrace:   state.startTrace(driverID, driver),
-		}, nil
+		completion := MatchCompletion{FailedTrace: &failed}
+		nextTrace, err := state.startTrace(driverID, driver)
+		if err != nil {
+			return MatchCompletion{}, err
+		}
+		completion.NextTrace = nextTrace
+		return completion, nil
 	}
 
 	driver.inFlight = nil
-	return MatchCompletion{
-		NextTrace: state.startTrace(driverID, driver),
-	}, nil
+	nextTrace, err := state.startTrace(driverID, driver)
+	if err != nil {
+		return MatchCompletion{}, err
+	}
+	return MatchCompletion{NextTrace: nextTrace}, nil
 }
 
-// EvictInactive chỉ dọn driver không có match đang chạy. Timeout GraphHopper
-// phải được worker chuyển thành CompleteMatch(..., false).
+// EvictInactive xóa state của tài xế đã ngừng gửi GPS và không có trace đang xử lý.
+// Output là số tài xế đã bị xóa khỏi state.
 func (state *ConsumerState) EvictInactive(now time.Time) int {
 	now = now.UTC()
 	removed := 0
@@ -236,35 +207,43 @@ func (state *ConsumerState) EvictInactive(now time.Time) int {
 	return removed
 }
 
-func (state *ConsumerState) startTrace(driverID string, driver *DriverState) *Trace {
+// startTrace lấy TracePoints GPS đầu buffer, kiểm tra độ dịch chuyển, tạo Trace
+// và giữ lại OverlapPoints cho cửa sổ kế tiếp.
+func (state *ConsumerState) startTrace(
+	driverID string,
+	driver *DriverState,
+) (*Trace, error) {
 	if driver.inFlight != nil || len(driver.Points) < state.config.TracePoints {
-		return nil
+		return nil, nil
 	}
 
 	candidate := driver.Points[:state.config.TracePoints]
 	if !hasMinimumDisplacement(candidate, state.config.MinDisplacementM) {
-		return nil
+		return nil, nil
 	}
 
-	points := append(
-		[]CanonicalEvent(nil),
-		candidate...,
-	)
+	points := append([]CanonicalEvent(nil), candidate...)
+	startedAt, err := points[0].RecordedAt()
+	if err != nil {
+		return nil, fmt.Errorf("derive trace start time: %w", err)
+	}
+	endedAt, err := points[len(points)-1].RecordedAt()
+	if err != nil {
+		return nil, fmt.Errorf("derive trace end time: %w", err)
+	}
 	trace := Trace{
 		TraceID: fmt.Sprintf(
-			"%s:%s:%s",
+			"%s:%d:%d",
 			driverID,
-			points[0].EventID,
-			points[len(points)-1].EventID,
+			startedAt.UnixMilli(),
+			endedAt.UnixMilli(),
 		),
 		DriverID:  driverID,
-		StartedAt: time.UnixMilli(points[0].RecordedAtMS).UTC(),
-		EndedAt:   time.UnixMilli(points[len(points)-1].RecordedAtMS).UTC(),
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
 		Points:    points,
 	}
 
-	// Di chuyển trace sang inFlight ngay khi tạo. Points chỉ giữ overlap và
-	// những GPS đến sau trace này, nên completion không cần xóa theo số lượng.
 	consumed := state.config.TracePoints - state.config.OverlapPoints
 	driver.Points = append([]CanonicalEvent(nil), driver.Points[consumed:]...)
 	driver.inFlight = &inFlightMatch{
@@ -273,9 +252,11 @@ func (state *ConsumerState) startTrace(driverID string, driver *DriverState) *Tr
 	}
 
 	result := cloneTrace(trace)
-	return &result
+	return &result, nil
 }
 
+// dropFailedOverlap bỏ phần overlap thuộc trace đã thất bại, nhưng chỉ khi
+// từng event khớp để không xóa nhầm GPS của trace mới.
 func (state *ConsumerState) dropFailedOverlap(driver *DriverState, failed Trace) {
 	overlap := state.config.OverlapPoints
 	if overlap == 0 || len(driver.Points) < overlap || len(failed.Points) < overlap {
@@ -284,44 +265,15 @@ func (state *ConsumerState) dropFailedOverlap(driver *DriverState, failed Trace)
 
 	failedSuffix := failed.Points[len(failed.Points)-overlap:]
 	for index := 0; index < overlap; index++ {
-		if driver.Points[index].EventID != failedSuffix[index].EventID {
+		if !sameEventIdentity(driver.Points[index], failedSuffix[index]) {
 			return
 		}
 	}
 	driver.Points = append([]CanonicalEvent(nil), driver.Points[overlap:]...)
 }
 
+// cloneTrace sao chép slice Points để caller không sửa chung backing array với state.
 func cloneTrace(trace Trace) Trace {
 	trace.Points = append([]CanonicalEvent(nil), trace.Points...)
 	return trace
-}
-
-func hasMinimumDisplacement(points []CanonicalEvent, minimumMeters float64) bool {
-	if minimumMeters <= 0 {
-		return true
-	}
-
-	first := points[0]
-	for _, point := range points[1:] {
-		if haversineMeters(first.Latitude, first.Longitude, point.Latitude, point.Longitude) >= minimumMeters {
-			return true
-		}
-	}
-	return false
-}
-
-func haversineMeters(lat1 float64, lon1 float64, lat2 float64, lon2 float64) float64 {
-	const earthRadiusMeters = 6371000.0
-
-	lat1Radians := lat1 * math.Pi / 180
-	lat2Radians := lat2 * math.Pi / 180
-	deltaLatitude := (lat2 - lat1) * math.Pi / 180
-	deltaLongitude := (lon2 - lon1) * math.Pi / 180
-
-	sinLatitude := math.Sin(deltaLatitude / 2)
-	sinLongitude := math.Sin(deltaLongitude / 2)
-	a := sinLatitude*sinLatitude +
-		math.Cos(lat1Radians)*math.Cos(lat2Radians)*sinLongitude*sinLongitude
-	a = math.Min(1, math.Max(0, a))
-	return earthRadiusMeters * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }

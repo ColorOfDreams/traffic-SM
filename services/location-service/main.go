@@ -20,6 +20,7 @@ import (
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/gps"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/mapview"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/matching"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/traffic"
 )
 
 const maxGPSRequestBytes = 64 * 1024
@@ -47,6 +48,7 @@ type serviceConfig struct {
 	kafkaCommitEvery    time.Duration
 	graphHopperURL      string
 	graphHopperProfile  string
+	graphVersion        string
 	graphHopperTimeout  time.Duration
 	graphHopperAccuracy float64
 	graphHopperWorkers  int
@@ -97,11 +99,21 @@ func run() error {
 		return err
 	}
 
+	fragmentScope, err := traffic.NewTile38Scope(
+		config.tile38Address,
+		config.edgeCollections,
+	)
+	if err != nil {
+		return err
+	}
+
 	matcher, err := matching.NewClient(matching.Config{
-		BaseURL:     config.graphHopperURL,
-		Profile:     config.graphHopperProfile,
-		GPSAccuracy: config.graphHopperAccuracy,
-		Timeout:     config.graphHopperTimeout,
+		BaseURL:       config.graphHopperURL,
+		Profile:       config.graphHopperProfile,
+		GraphVersion:  config.graphVersion,
+		GPSAccuracy:   config.graphHopperAccuracy,
+		Timeout:       config.graphHopperTimeout,
+		FragmentScope: fragmentScope,
 	})
 	if err != nil {
 		return err
@@ -215,8 +227,8 @@ func newHandlerWithPublisher(edgeReader graphEdgeReader, publisher gpsPublisher)
 				return
 			}
 			writeJSON(w, http.StatusAccepted, map[string]string{
-				"status":   "queued",
-				"event_id": event.EventID,
+				"status":    "queued",
+				"driver_id": event.DriverID,
 			})
 			return
 		}
@@ -287,6 +299,7 @@ func loadConfig() (serviceConfig, error) {
 		kafkaMatcherGroup:  envOrDefault("KAFKA_MATCHER_GROUP", "location-map-matching-v2"),
 		graphHopperURL:     envOrDefault("GRAPHHOPPER_URL", "http://graphhopper:8989"),
 		graphHopperProfile: envOrDefault("GRAPHHOPPER_PROFILE", "car"),
+		graphVersion:       envOrDefault("GRAPH_VERSION", "vietnam-20260722"),
 		edgeCollections: splitNonEmpty(
 			envOrDefault(
 				"GPS_EDGE_COLLECTIONS",
