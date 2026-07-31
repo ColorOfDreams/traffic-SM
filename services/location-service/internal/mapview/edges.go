@@ -63,15 +63,18 @@ func (reader *Tile38EdgeReader) ReadBounds(bounds Bounds, limit int) (FeatureCol
 		return FeatureCollection{}, err
 	}
 	defer client.Close()
+	if _, err := client.Do("OUTPUT", "json"); err != nil {
+		return FeatureCollection{}, fmt.Errorf("configure Tile38 JSON output: %w", err)
+	}
 
 	result := FeatureCollection{
 		Type:     "FeatureCollection",
 		Features: make([]Feature, 0),
 	}
-	seenEdgeIDs := make(map[string]struct{})
+	seenFeatureIDs := make(map[string]struct{})
 
 	for _, collection := range reader.collections {
-		truncated, err := reader.readCollection(client, collection, bounds, limit, seenEdgeIDs, &result)
+		truncated, err := reader.readCollection(client, collection, bounds, limit, seenFeatureIDs, &result)
 		if err != nil {
 			return FeatureCollection{}, err
 		}
@@ -89,7 +92,7 @@ func (reader *Tile38EdgeReader) readCollection(
 	collection string,
 	bounds Bounds,
 	limit int,
-	seenEdgeIDs map[string]struct{},
+	seenFeatureIDs map[string]struct{},
 	result *FeatureCollection,
 ) (bool, error) {
 	cursor := 0
@@ -122,18 +125,14 @@ func (reader *Tile38EdgeReader) readCollection(
 
 		for _, item := range response.Objects {
 			properties := mapFields(response.Fields, item.Fields)
-			edgeID := propertyKey(properties["edge_id"])
-			if edgeID == "" {
-				edgeID = item.ID
-			}
-			if _, exists := seenEdgeIDs[edgeID]; exists {
+			if _, exists := seenFeatureIDs[item.ID]; exists {
 				continue
 			}
 			if len(result.Features) >= limit {
 				return true, nil
 			}
 
-			seenEdgeIDs[edgeID] = struct{}{}
+			seenFeatureIDs[item.ID] = struct{}{}
 			result.Features = append(result.Features, Feature{
 				Type:       "Feature",
 				ID:         item.ID,
@@ -167,17 +166,6 @@ func mapFields(names []string, values []any) map[string]any {
 		}
 	}
 	return properties
-}
-
-func propertyKey(value any) string {
-	switch typed := value.(type) {
-	case json.Number:
-		return typed.String()
-	case string:
-		return typed
-	default:
-		return ""
-	}
 }
 
 func formatFloat(value float64) string {

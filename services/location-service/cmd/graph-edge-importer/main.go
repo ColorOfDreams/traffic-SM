@@ -34,14 +34,16 @@ var includedRoadClasses = map[string]struct{}{
 }
 
 var allowedProperties = map[string]struct{}{
-	"graph_version": {},
-	"edge_id":       {},
-	"traversal_key": {},
-	"forward":       {},
-	"osm_way_id":    {},
-	"distance_m":    {},
-	"road_class":    {},
-	"name":          {},
+	"graph_version":     {},
+	"edge_id":           {},
+	"traversal_key":     {},
+	"forward":           {},
+	"osm_way_id":        {},
+	"distance_m":        {},
+	"road_class":        {},
+	"car_access":        {},
+	"motorcycle_access": {},
+	"name":              {},
 }
 
 // Khai báo kiểu dữ liệu
@@ -245,6 +247,17 @@ func validateFeature(item feature, expectedGraphVersion string) error {
 	if _, ok := includedRoadClasses[roadClass]; !ok {
 		return errors.New("feature has unsupported road_class")
 	}
+	carAccess, err := boolProperty(item.Properties, "car_access")
+	if err != nil {
+		return err
+	}
+	motorcycleAccess, err := boolProperty(item.Properties, "motorcycle_access")
+	if err != nil {
+		return err
+	}
+	if !carAccess && !motorcycleAccess {
+		return errors.New("feature is inaccessible to both car and motorcycle")
+	}
 	if _, ok := item.Properties["name"]; ok {
 		if _, err := stringProperty(item.Properties, "name"); err != nil {
 			return err
@@ -282,6 +295,8 @@ func importFeature(client *tile38.Client, collection string, item feature) error
 		{"osm_way_id", "osm_way_id"},
 		{"distance_m", "distance_m"},
 		{"road_class", "road_class"},
+		{"car_access", "car_access"},
+		{"motorcycle_access", "motorcycle_access"},
 		{"name", "name"},
 	}
 

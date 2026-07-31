@@ -18,6 +18,12 @@ Ba service chạy trong cùng một Docker network:
 
 Location Service có thể kết nối tới GraphHopper và Tile38 thông qua service name của Docker Compose, không sử dụng IP container cố định.
 
+## Định hướng cấu trúc code
+
+Phần Location Service viết lại sử dụng **Feature-first Pipeline với Matching Strategy**. Pipeline dùng một output map matching chung để có thể bắt đầu với GraphHopper và thay hoặc so sánh với phương pháp Tile38 xử lý từng GPS trong tương lai.
+
+Xem cấu trúc package, luồng phụ thuộc và các pattern dự kiến tại [docs/traffic_structure.md](../docs/traffic_structure.md).
+
 ## Yêu cầu
 
 Máy phát triển cần có:

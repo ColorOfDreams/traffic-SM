@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Traffic Map View</title>
+  <link rel="preconnect" href="https://unpkg.com">
+  <link rel="preconnect" href="https://tile.openstreetmap.org">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    * { box-sizing: border-box; }
+
+    html, body, #map {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+    }
+
+    body {
+      overflow: hidden;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #e4e9e4;
+    }
+
+    #map { background: #e4e9e4; }
+
+    .map-bar {
+      position: fixed;
+      z-index: 800;
+      top: 20px;
+      left: 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 14px;
+      border: 1px solid rgba(255, 255, 255, 0.82);
+      border-radius: 15px;
+      background: rgba(255, 255, 255, 0.93);
+      box-shadow: 0 12px 34px rgba(20, 45, 35, 0.16);
+      backdrop-filter: blur(14px);
+    }
+
+    .mark {
+      display: grid;
+      width: 36px;
+      height: 36px;
+      place-items: center;
+      border-radius: 10px;
+      color: white;
+      background: #116b4b;
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    .map-bar strong {
+      display: block;
+      color: #14221d;
+      font-size: 14px;
+    }
+
+    .map-bar span {
+      display: block;
+      margin-top: 2px;
+      color: #116b4b;
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .legend {
+      position: fixed;
+      z-index: 800;
+      bottom: 24px;
+      left: 24px;
+      display: flex;
+      gap: 15px;
+      padding: 10px 13px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.93);
+      box-shadow: 0 10px 28px rgba(20, 45, 35, 0.14);
+      color: #5d6b64;
+      font-size: 11px;
+    }
+
+    .legend span {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .line {
+      width: 24px;
+      height: 4px;
+      border-radius: 999px;
+      background: #65756d;
+    }
+
+    .line.selected {
+      background: repeating-linear-gradient(
+        90deg,
+        #65756d 0,
+        #65756d 5px,
+        transparent 5px,
+        transparent 9px
+      );
+    }
+
+    .error {
+      position: fixed;
+      z-index: 900;
+      top: 20px;
+      right: 20px;
+      display: none;
+      padding: 11px 14px;
+      border-radius: 12px;
+      color: #982b26;
+      background: #fde8e5;
+      box-shadow: 0 10px 28px rgba(20, 45, 35, 0.14);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .leaflet-control-zoom {
+      border: 0 !important;
+      box-shadow: 0 9px 26px rgba(20, 45, 35, 0.17) !important;
+    }
+
+    .leaflet-control-zoom a {
+      color: #14221d !important;
+      border: 0 !important;
+    }
+
+    .leaflet-popup-content-wrapper {
+      border-radius: 12px;
+      box-shadow: 0 14px 34px rgba(20, 45, 35, 0.18);
+    }
+  </style>
+</head>
+<body>
+  <main id="map" aria-label="Traffic map"></main>
+
+  <div class="map-bar">
+    <div class="mark">T</div>
+    <div>
+      <strong>Traffic Map</strong>
+      <span id="edge-count">Đang tải</span>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="line"></i>Forward</span>
+    <span><i class="line selected"></i>Reverse</span>
+  </div>
+
+  <div class="error" id="error" role="alert"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const bounds = "105.75,20.95,106.00,21.15";
+    const map = L.map("map", { zoomControl: false, preferCanvas: true })
+      .setView([21.03, 105.85], 11);
+
+    L.control.zoom({ position: "bottomright" }).addTo(map);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 20,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+
+    function styleEdge(feature) {
+      const status = String(feature.properties.traffic_status || "unknown").toLowerCase();
+      const colors = {
+        free: "#18895e",
+        slow: "#db8b24",
+        congested: "#d9413a",
+        severe: "#a8201a",
+        unknown: "#65756d"
+      };
+      return {
+        color: colors[status] || colors.unknown,
+        weight: 1.7,
+        opacity: feature.properties.forward ? 0.52 : 0.78,
+        dashArray: feature.properties.forward ? null : "5 5",
+        lineCap: "round"
+      };
+    }
+
+    function popup(feature) {
+      const properties = feature.properties;
+      return [
+        "<strong>" + properties.traversal_key + "</strong>",
+        properties.road_class,
+        properties.forward ? "forward" : "reverse",
+        properties.traffic_status || "unknown"
+      ].join("<br>");
+    }
+
+    async function loadEdges() {
+      const error = document.getElementById("error");
+      try {
+        const response = await fetch("/v1/graph-edges?bbox=" + bounds);
+        if (!response.ok) {
+          throw new Error("Không tải được edge");
+        }
+        const collection = await response.json();
+        const layer = L.geoJSON(collection, {
+          style: styleEdge,
+          onEachFeature(feature, edgeLayer) {
+            edgeLayer.bindPopup(popup(feature));
+          }
+        }).addTo(map);
+
+        if (layer.getBounds().isValid()) {
+          map.fitBounds(layer.getBounds(), { padding: [28, 28] });
+        }
+
+        document.getElementById("edge-count").textContent =
+          collection.features.length.toLocaleString("vi-VN") + " edges";
+      } catch (cause) {
+        error.textContent = cause.message;
+        error.style.display = "block";
+      }
+    }
+
+    loadEdges();
+  </script>
+</body>
+</html>

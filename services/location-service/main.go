@@ -35,25 +35,26 @@ type gpsPublisher interface {
 }
 
 type serviceConfig struct {
-	port                string
-	tile38Address       string
-	edgeCollections     []string
-	kafkaBrokers        []string
-	kafkaRawTopic       string
-	kafkaTraceTopic     string
-	kafkaMatchedTopic   string
-	kafkaDeadTopic      string
-	kafkaTraceGroup     string
-	kafkaMatcherGroup   string
-	kafkaCommitEvery    time.Duration
-	graphHopperURL      string
-	graphHopperProfile  string
-	graphVersion        string
-	graphHopperTimeout  time.Duration
-	graphHopperAccuracy float64
-	graphHopperWorkers  int
-	matchQueueSize      int
-	stateConfig         gps.ConsumerStateConfig
+	port                         string
+	tile38Address                string
+	edgeCollections              []string
+	kafkaBrokers                 []string
+	kafkaRawTopic                string
+	kafkaTraceTopic              string
+	kafkaMatchedTopic            string
+	kafkaDeadTopic               string
+	kafkaTraceGroup              string
+	kafkaMatcherGroup            string
+	kafkaCommitEvery             time.Duration
+	graphHopperURL               string
+	graphHopperCarProfile        string
+	graphHopperMotorcycleProfile string
+	graphVersion                 string
+	graphHopperTimeout           time.Duration
+	graphHopperAccuracy          float64
+	graphHopperWorkers           int
+	matchQueueSize               int
+	stateConfig                  gps.ConsumerStateConfig
 }
 
 func main() {
@@ -108,12 +109,13 @@ func run() error {
 	}
 
 	matcher, err := matching.NewClient(matching.Config{
-		BaseURL:       config.graphHopperURL,
-		Profile:       config.graphHopperProfile,
-		GraphVersion:  config.graphVersion,
-		GPSAccuracy:   config.graphHopperAccuracy,
-		Timeout:       config.graphHopperTimeout,
-		FragmentScope: fragmentScope,
+		BaseURL:           config.graphHopperURL,
+		CarProfile:        config.graphHopperCarProfile,
+		MotorcycleProfile: config.graphHopperMotorcycleProfile,
+		GraphVersion:      config.graphVersion,
+		GPSAccuracy:       config.graphHopperAccuracy,
+		Timeout:           config.graphHopperTimeout,
+		FragmentScope:     fragmentScope,
 	})
 	if err != nil {
 		return err
@@ -252,6 +254,14 @@ func newHandlerWithPublisher(edgeReader graphEdgeReader, publisher gpsPublisher)
 		}
 		writeJSON(w, http.StatusOK, features)
 	})
+	mux.HandleFunc("GET /v1/demo/congestion-flow", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, mapview.NewDemoFlow(time.Now()))
+	})
+	mux.HandleFunc("GET /map", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(mapview.Page())
+	})
 	return mux
 }
 
@@ -288,22 +298,23 @@ func parseBounds(value string) (mapview.Bounds, error) {
 // load config kiểm tra
 func loadConfig() (serviceConfig, error) {
 	config := serviceConfig{
-		port:               envOrDefault("PORT", "8080"),
-		tile38Address:      envOrDefault("TILE38_ADDRESS", "tile38:9851"),
-		kafkaBrokers:       splitNonEmpty(envOrDefault("KAFKA_BROKERS", "kafka:29092")),
-		kafkaRawTopic:      envOrDefault("KAFKA_RAW_TOPIC", "gps.raw"),
-		kafkaTraceTopic:    envOrDefault("KAFKA_TRACE_TOPIC", "gps.traces"),
-		kafkaMatchedTopic:  envOrDefault("KAFKA_MATCHED_TOPIC", "gps.matched"),
-		kafkaDeadTopic:     envOrDefault("KAFKA_DEAD_LETTER_TOPIC", "gps.dead-letter"),
-		kafkaTraceGroup:    envOrDefault("KAFKA_TRACE_BUILDER_GROUP", "location-trace-builder-v1"),
-		kafkaMatcherGroup:  envOrDefault("KAFKA_MATCHER_GROUP", "location-map-matching-v2"),
-		graphHopperURL:     envOrDefault("GRAPHHOPPER_URL", "http://graphhopper:8989"),
-		graphHopperProfile: envOrDefault("GRAPHHOPPER_PROFILE", "car"),
-		graphVersion:       envOrDefault("GRAPH_VERSION", "vietnam-20260722"),
+		port:                         envOrDefault("PORT", "8080"),
+		tile38Address:                envOrDefault("TILE38_ADDRESS", "tile38:9851"),
+		kafkaBrokers:                 splitNonEmpty(envOrDefault("KAFKA_BROKERS", "kafka:29092")),
+		kafkaRawTopic:                envOrDefault("KAFKA_RAW_TOPIC", "gps.raw"),
+		kafkaTraceTopic:              envOrDefault("KAFKA_TRACE_TOPIC", "gps.traces"),
+		kafkaMatchedTopic:            envOrDefault("KAFKA_MATCHED_TOPIC", "gps.matched"),
+		kafkaDeadTopic:               envOrDefault("KAFKA_DEAD_LETTER_TOPIC", "gps.dead-letter"),
+		kafkaTraceGroup:              envOrDefault("KAFKA_TRACE_BUILDER_GROUP", "location-trace-builder-v1"),
+		kafkaMatcherGroup:            envOrDefault("KAFKA_MATCHER_GROUP", "location-map-matching-v2"),
+		graphHopperURL:               envOrDefault("GRAPHHOPPER_URL", "http://graphhopper:8989"),
+		graphHopperCarProfile:        envOrDefault("GRAPHHOPPER_CAR_PROFILE", "car"),
+		graphHopperMotorcycleProfile: envOrDefault("GRAPHHOPPER_MOTORCYCLE_PROFILE", "motorcycle"),
+		graphVersion:                 envOrDefault("GRAPH_VERSION", "vietnam-20260730-motorcycle-v1"),
 		edgeCollections: splitNonEmpty(
 			envOrDefault(
 				"GPS_EDGE_COLLECTIONS",
-				"hanoi_graph_edges_vietnam_20260722,hochiminh_graph_edges_vietnam_20260722",
+				"hanoi_graph_edges_vietnam_20260730_motorcycle_v1,hochiminh_graph_edges_vietnam_20260730_motorcycle_v1",
 			),
 		),
 	}

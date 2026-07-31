@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,5 +97,42 @@ func TestGraphEdgesRejectInvalidBounds(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDemoCongestionFlowReturned(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/v1/demo/congestion-flow", nil)
+	response := httptest.NewRecorder()
+
+	newHandler(fakeGraphEdgeReader{}).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+	}
+	var flow mapview.DemoFlow
+	if err := json.Unmarshal(response.Body.Bytes(), &flow); err != nil {
+		t.Fatal(err)
+	}
+	if flow.TraversalKey != 366218 ||
+		flow.Aggregation.EligibleDriverCount != 2 ||
+		flow.Observations[2].BehaviorState != "BUSINESS_STOP" {
+		t.Fatalf("unexpected demo flow %#v", flow)
+	}
+}
+
+func TestMapViewReturned(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/map", nil)
+	response := httptest.NewRecorder()
+
+	newHandler(fakeGraphEdgeReader{}).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", response.Code)
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "text/html; charset=utf-8" {
+		t.Fatalf("unexpected content type %q", contentType)
+	}
+	if !strings.Contains(response.Body.String(), "<title>Traffic Map View</title>") {
+		t.Fatalf("unexpected map page")
 	}
 }

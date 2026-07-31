@@ -80,7 +80,7 @@ services:
     volumes:
       - ./data/osm:/data/osm:ro
       - ./services/graphhopper/config/config.yml:/app/config/config.yml:ro
-      - graphhopper-cache-vietnam-20260722:/data/graph-cache
+      - graphhopper-cache-vietnam-20260730-motorcycle-v1:/data/graph-cache
     cap_drop:
       - ALL
     security_opt:
@@ -102,8 +102,9 @@ services:
       PORT: "8080"
       TILE38_ADDRESS: "tile38:9851"
       GRAPHHOPPER_URL: "http://graphhopper:8989"
-      GRAPHHOPPER_PROFILE: "car"
-      GRAPH_VERSION: "vietnam-20260722"
+      GRAPHHOPPER_CAR_PROFILE: "car"
+      GRAPHHOPPER_MOTORCYCLE_PROFILE: "motorcycle"
+      GRAPH_VERSION: "vietnam-20260730-motorcycle-v1"
       GRAPHHOPPER_TIMEOUT: "5s"
       GRAPHHOPPER_GPS_ACCURACY: "10"
       GRAPHHOPPER_WORKERS: "4"
@@ -124,7 +125,7 @@ services:
       DRIVER_MAX_BUFFERED_POINTS: "20"
       MATCH_MAX_ATTEMPTS: "3"
       MATCH_QUEUE_SIZE: "64"
-      GPS_EDGE_COLLECTIONS: "hanoi_graph_edges_vietnam_20260722,hochiminh_graph_edges_vietnam_20260722"
+      GPS_EDGE_COLLECTIONS: "hanoi_graph_edges_vietnam_20260730_motorcycle_v1,hochiminh_graph_edges_vietnam_20260730_motorcycle_v1"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -150,3 +151,4 @@ volumes:
   kafka-data:
   graphhopper-cache:
   graphhopper-cache-vietnam-20260722:
+  graphhopper-cache-vietnam-20260730-motorcycle-v1:
