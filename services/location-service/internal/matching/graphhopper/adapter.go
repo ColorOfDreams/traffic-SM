@@ -2,13 +2,23 @@ package graphhopper
 
 import (
 	"fmt"
+	"math"
+	"strings"
 
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/matching"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/trace"
 )
 
 // Kiểm tra dữ liệu graphhopper trả về và ghép dữ liệu gốc với map matching, cuối cùng trả về dữ liệu cần
-func adaptResponse(input trace.Trace, response matchResponse) ([]matching.MatchedObservation, error) {
+func adaptResponse(
+	input trace.Trace,
+	response matchResponse,
+	graphVersion string,
+) ([]matching.MatchedObservation, error) {
+	graphVersion = strings.TrimSpace(graphVersion)
+	if graphVersion == "" {
+		return nil, fmt.Errorf("graph version is required")
+	}
 	// Kiểm tra
 	if len(response.MatchedPoints) != len(input.Points) {
 		return nil, fmt.Errorf(
@@ -58,37 +68,53 @@ func adaptResponse(input trace.Trace, response matchResponse) ([]matching.Matche
 			)
 		}
 
+		trafficEligible := matchedPoint.EligibleForTraffic != nil &&
+			*matchedPoint.EligibleForTraffic
 		observation := matching.MatchedObservation{
-			DriverID:    originalPoint.DriverID,
-			PointIndex:  index,
-			RecordedAt:  originalPoint.RecordedAt,
-			Speed:       originalPoint.Speed,
-			Status:      originalPoint.Status,
-			VehicleType: originalPoint.VehicleType,
-			Matched:     matchedPoint.Matched,
+			GraphVersion:    graphVersion,
+			DriverID:        originalPoint.DriverID,
+			PointIndex:      index,
+			RecordedAt:      originalPoint.RecordedAt,
+			Speed:           originalPoint.Speed,
+			Status:          originalPoint.Status,
+			VehicleType:     originalPoint.VehicleType,
+			Matched:         matchedPoint.Matched,
+			TrafficEligible: trafficEligible,
+		}
+		if trafficEligible && !matchedPoint.Matched {
+			return nil, fmt.Errorf(
+				"unmatched point %d cannot be eligible for traffic",
+				index,
+			)
 		}
 
 		if matchedPoint.Matched {
-			if matchedPoint.TraversalKey == nil ||
-				matchedPoint.SnappedLat == nil ||
-				matchedPoint.SnappedLon == nil ||
-				matchedPoint.SnapDistanceM == nil {
-
+			if matchedPoint.EligibleForTraffic == nil {
 				return nil, fmt.Errorf(
-					"matched point %d is missing matching fields",
+					"matched point %d is missing eligible_for_traffic",
 					index,
 				)
 			}
-
+			if matchedPoint.TraversalKey == nil {
+				return nil, fmt.Errorf(
+					"matched point %d is missing traversal_key",
+					index,
+				)
+			}
 			traversalKey := *matchedPoint.TraversalKey
-			snappedLat := *matchedPoint.SnappedLat
-			snappedLng := *matchedPoint.SnappedLon
-			snapDistanceM := *matchedPoint.SnapDistanceM
 
 			observation.TraversalKey = &traversalKey
-			observation.SnappedLat = &snappedLat
-			observation.SnappedLng = &snappedLng
-			observation.SnapDistanceM = &snapDistanceM
+			if matchedPoint.MaxSpeedKMH != nil {
+				maxSpeedKMH := *matchedPoint.MaxSpeedKMH
+				if maxSpeedKMH <= 0 || math.IsNaN(maxSpeedKMH) || math.IsInf(maxSpeedKMH, 0) {
+					return nil, fmt.Errorf(
+						"matched point %d has invalid max_speed_kmh",
+						index,
+					)
+				}
+				maxSpeedMPS := maxSpeedKMH / 3.6
+				observation.MaxSpeedMPS = &maxSpeedMPS
+			}
 		}
 
 		observations[index] = observation

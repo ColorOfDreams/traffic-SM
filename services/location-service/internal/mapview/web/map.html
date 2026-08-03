@@ -66,6 +66,42 @@
       font-weight: 800;
     }
 
+    .distance-picker {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-left: 4px;
+      color: #42534b;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .distance-picker select {
+      padding: 7px 9px;
+      border: 1px solid #cbd7d1;
+      border-radius: 9px;
+      color: #14221d;
+      background: #ffffff;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .congestion-button {
+      padding: 8px 12px;
+      border: 0;
+      border-radius: 9px;
+      color: #ffffff;
+      background: #d9413a;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .congestion-button:disabled {
+      cursor: wait;
+      opacity: 0.62;
+    }
+
     .legend {
       position: fixed;
       z-index: 800;
@@ -94,14 +130,14 @@
       background: #65756d;
     }
 
-    .line.selected {
-      background: repeating-linear-gradient(
-        90deg,
-        #65756d 0,
-        #65756d 5px,
-        transparent 5px,
-        transparent 9px
-      );
+    .line.free { background: #22a06b; }
+    .line.slow { background: #f2a01f; }
+    .line.unknown { background: #89968f; }
+
+    .line.congested {
+      height: 6px;
+      background: #d9413a;
+      box-shadow: 0 0 0 2px rgba(217, 65, 58, 0.18);
     }
 
     .error {
@@ -142,22 +178,49 @@
     <div class="mark">T</div>
     <div>
       <strong>Traffic Map</strong>
-      <span id="edge-count">Đang tải</span>
+      <span id="edge-count">Chọn số km để tải edge</span>
     </div>
+    <label class="distance-picker">
+      Chiều dài
+      <select id="distance-km">
+        <option value="" selected>Chọn số km</option>
+        <option value="1">1 km</option>
+        <option value="5">5 km</option>
+        <option value="10">10 km</option>
+        <option value="25">25 km</option>
+        <option value="50">50 km</option>
+        <option value="100">100 km</option>
+        <option value="250">250 km</option>
+        <option value="500">500 km</option>
+        <option value="1000">1000 km</option>
+      </select>
+    </label>
+    <button class="congestion-button" id="congestion-button" type="button">
+      Tính congestion
+    </button>
   </div>
 
   <div class="legend">
-    <span><i class="line"></i>Forward</span>
-    <span><i class="line selected"></i>Reverse</span>
+    <span><i class="line free"></i>Edge trong Tile38</span>
+    <span><i class="line slow"></i>Chậm</span>
+    <span><i class="line congested"></i>Tắc nghẽn</span>
+    <span><i class="line unknown"></i>Chưa có dữ liệu</span>
   </div>
 
   <div class="error" id="error" role="alert"></div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const bounds = "105.75,20.95,106.00,21.15";
+    const demoBounds = "105.92,20.97,105.97,21.02";
     const map = L.map("map", { zoomControl: false, preferCanvas: true })
-      .setView([21.03, 105.85], 11);
+      .setView([20.989, 105.942], 13);
+
+    let allEdges = null;
+    let casingLayer = null;
+    let edgeLayer = null;
+    let displayedTraversalKeys = new Set();
+    let edgeRequestController = null;
+    let edgeRequestTimer = null;
 
     L.control.zoom({ position: "bottomright" }).addTo(map);
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -165,62 +228,328 @@
       attribution: "&copy; OpenStreetMap contributors"
     }).addTo(map);
 
+    function hasAccess(value) {
+      return value === true || value === 1 || value === "1" || value === "true";
+    }
+
+    function annotateDirections(collection) {
+      const directionsByEdge = new Map();
+      for (const feature of collection.features) {
+        const properties = feature.properties;
+        const edgeID = String(properties.edge_id);
+        if (!directionsByEdge.has(edgeID)) {
+          directionsByEdge.set(edgeID, {
+            forward: false,
+            reverse: false,
+            carSupported: false,
+            motorcycleSupported: false
+          });
+        }
+        const directions = directionsByEdge.get(edgeID);
+        if (properties.forward) {
+          directions.forward = true;
+        } else {
+          directions.reverse = true;
+        }
+        directions.carSupported ||= hasAccess(properties.car_access);
+        directions.motorcycleSupported ||=
+          hasAccess(properties.motorcycle_access);
+      }
+
+      for (const feature of collection.features) {
+        const directions = directionsByEdge.get(String(feature.properties.edge_id));
+        feature.properties.road_direction = directionLabel(
+          directions.forward,
+          directions.reverse
+        );
+        feature.properties.car_supported = directions.carSupported;
+        feature.properties.motorcycle_supported = directions.motorcycleSupported;
+      }
+    }
+
+    function directionLabel(forward, reverse) {
+      if (forward && reverse) {
+        return "HAI CHIỀU";
+      }
+      if (forward) {
+        return "MỘT CHIỀU · forward";
+      }
+      if (reverse) {
+        return "MỘT CHIỀU · reverse";
+      }
+      return "KHÔNG HỖ TRỢ";
+    }
+
     function styleEdge(feature) {
-      const status = String(feature.properties.traffic_status || "unknown").toLowerCase();
+      const demo = feature.properties.demo_congestion;
+      const status = String(demo ? demo.level : "free").toLowerCase();
       const colors = {
-        free: "#18895e",
-        slow: "#db8b24",
-        congested: "#d9413a",
-        severe: "#a8201a",
-        unknown: "#65756d"
+        free: "#22a06b",
+        slow: "#f2a01f",
+        congested: "#e53935",
+        severe: "#a91515",
+        unknown: "#89968f"
       };
       return {
         color: colors[status] || colors.unknown,
-        weight: 1.7,
-        opacity: feature.properties.forward ? 0.52 : 0.78,
-        dashArray: feature.properties.forward ? null : "5 5",
-        lineCap: "round"
+        weight: demo ? 8 : 4.5,
+        opacity: demo ? 1 : 0.9,
+        lineCap: "round",
+        lineJoin: "round"
+      };
+    }
+
+    function styleCasing(feature) {
+      return {
+        color: "rgba(255, 255, 255, 0.96)",
+        weight: feature.properties.demo_congestion ? 12 : 8,
+        opacity: 1,
+        lineCap: "round",
+        lineJoin: "round"
       };
     }
 
     function popup(feature) {
       const properties = feature.properties;
-      return [
+      const lines = [
         "<strong>" + properties.traversal_key + "</strong>",
+        properties.name || "Không có tên đường",
         properties.road_class,
-        properties.forward ? "forward" : "reverse",
+        "Traversal: " + (properties.forward ? "forward" : "reverse"),
+        "Hướng đường: " + properties.road_direction,
+        "Ô tô: " + (properties.car_supported ? "được phép" : "không hỗ trợ"),
+        "Xe máy: " + (properties.motorcycle_supported ? "được phép" : "không hỗ trợ"),
         properties.traffic_status || "unknown"
-      ].join("<br>");
+      ];
+      if (properties.demo_congestion) {
+        const demo = properties.demo_congestion;
+        lines.push(
+          "<strong>Demo: " + demo.level + "</strong>",
+          "Current: " + demo.current_speed_mps.toFixed(1) + " m/s",
+          "Reference: " + demo.reference_speed_mps.toFixed(1) + " m/s",
+          "Ratio: " + demo.speed_ratio.toFixed(2),
+          "Score: " + demo.congestion_score.toFixed(2)
+        );
+      }
+      return lines.join("<br>");
     }
 
-    async function loadEdges() {
+    function selectDistance(collection, distanceKM) {
+      const targetDistanceM = distanceKM * 1000;
+      const features = [];
+      const seenEdgeIDs = new Set();
+      let displayedDistanceM = 0;
+
+      for (const feature of collection.features) {
+        const edgeID = String(feature.properties.edge_id);
+        const isNewEdge = !seenEdgeIDs.has(edgeID);
+        if (isNewEdge && displayedDistanceM >= targetDistanceM) {
+          break;
+        }
+
+        features.push(feature);
+        if (isNewEdge) {
+          seenEdgeIDs.add(edgeID);
+          displayedDistanceM += Number(feature.properties.distance_m || 0);
+        }
+      }
+
+      return {
+        collection: { type: "FeatureCollection", features },
+        displayedDistanceM
+      };
+    }
+
+    function renderEdges(distanceKM) {
+      if (!allEdges) {
+        return;
+      }
+      const selected = selectDistance(allEdges, distanceKM);
+      displayedTraversalKeys = new Set(
+        selected.collection.features.map(feature =>
+          Number(feature.properties.traversal_key)
+        )
+      );
       const error = document.getElementById("error");
+      const edgeCount = document.getElementById("edge-count");
+      error.style.display = "none";
+      if (casingLayer) {
+        map.removeLayer(casingLayer);
+      }
+      if (edgeLayer) {
+        map.removeLayer(edgeLayer);
+      }
+
+      casingLayer = L.geoJSON(selected.collection, {
+        interactive: false,
+        style: styleCasing
+      }).addTo(map);
+
+      edgeLayer = L.geoJSON(selected.collection, {
+        style: styleEdge,
+        onEachFeature(feature, edgeLayer) {
+          edgeLayer.bindPopup(popup(feature));
+        }
+      }).addTo(map);
+
+      if (edgeLayer.getBounds().isValid()) {
+        map.fitBounds(edgeLayer.getBounds(), {
+          padding: [28, 28],
+          maxZoom: 16
+        });
+      }
+
+      const physicalEdges = new Map();
+      for (const feature of selected.collection.features) {
+        physicalEdges.set(
+          String(feature.properties.edge_id),
+          feature.properties.road_direction
+        );
+      }
+      let oneWayCount = 0;
+      let twoWayCount = 0;
+      for (const direction of physicalEdges.values()) {
+        if (direction.startsWith("MỘT CHIỀU")) {
+          oneWayCount++;
+        } else if (direction === "HAI CHIỀU") {
+          twoWayCount++;
+        }
+      }
+
+      edgeCount.textContent =
+        selected.collection.features.length.toLocaleString("vi-VN") +
+        "/" + allEdges.features.length.toLocaleString("vi-VN") +
+        " edges · " + (selected.displayedDistanceM / 1000).toFixed(1) + " km" +
+        " · " + oneWayCount + " một chiều, " +
+        twoWayCount + " hai chiều";
+    }
+
+    async function loadEdges(distanceKM) {
+      const error = document.getElementById("error");
+      const edgeCount = document.getElementById("edge-count");
+      if (edgeRequestController) {
+        edgeRequestController.abort();
+      }
+      edgeRequestController = new AbortController();
+      edgeCount.textContent = "Đang query " + distanceKM + " km từ Tile38";
       try {
-        const response = await fetch("/v1/graph-edges?bbox=" + bounds);
+        const response = await fetch(
+          "/v1/graph-edges?bbox=" + demoBounds +
+          "&distance_km=" + encodeURIComponent(distanceKM),
+          { signal: edgeRequestController.signal }
+        );
         if (!response.ok) {
           throw new Error("Không tải được edge");
         }
-        const collection = await response.json();
-        const layer = L.geoJSON(collection, {
-          style: styleEdge,
-          onEachFeature(feature, edgeLayer) {
-            edgeLayer.bindPopup(popup(feature));
-          }
-        }).addTo(map);
-
-        if (layer.getBounds().isValid()) {
-          map.fitBounds(layer.getBounds(), { padding: [28, 28] });
-        }
-
-        document.getElementById("edge-count").textContent =
-          collection.features.length.toLocaleString("vi-VN") + " edges";
+        allEdges = await response.json();
+        annotateDirections(allEdges);
+        renderEdges(distanceKM);
       } catch (cause) {
+        if (cause.name === "AbortError") {
+          return;
+        }
         error.textContent = cause.message;
         error.style.display = "block";
+        edgeCount.textContent = "Tải dữ liệu thất bại";
       }
     }
 
-    loadEdges();
+    async function calculateCongestion() {
+      const button = document.getElementById("congestion-button");
+      const error = document.getElementById("error");
+      const edgeCount = document.getElementById("edge-count");
+      if (!allEdges) {
+        error.textContent = "Hãy chọn số km và tải edge trước";
+        error.style.display = "block";
+        return;
+      }
+      const distanceKM = Number(distancePicker.value);
+      if (distanceKM > 500) {
+        error.textContent = "Demo congestion chỉ xử lý tối đa 500 km";
+        error.style.display = "block";
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = "Đang tính…";
+      error.style.display = "none";
+      edgeCount.textContent = "Đang tính congestion";
+      try {
+        const leafletBounds = edgeLayer.getBounds();
+        const response = await fetch("/v1/demo/congestion", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            traversal_keys: Array.from(displayedTraversalKeys),
+            bounds: {
+              min_longitude: leafletBounds.getWest(),
+              min_latitude: leafletBounds.getSouth(),
+              max_longitude: leafletBounds.getEast(),
+              max_latitude: leafletBounds.getNorth()
+            },
+            vehicle_type: "motorcycle"
+          })
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(
+            body.error?.message || "Không tính được congestion"
+          );
+        }
+        const result = await response.json();
+        for (const feature of allEdges.features) {
+          delete feature.properties.demo_congestion;
+        }
+        if (!result.states.length) {
+          edgeCount.textContent =
+            "Không đủ dữ liệu · " + result.candidate_points +
+            " GPS · " + result.matched_traces + " trace đã match";
+          return;
+        }
+
+        for (const state of result.states) {
+          for (const feature of allEdges.features) {
+            if (Number(feature.properties.traversal_key) === Number(state.TraversalKey)) {
+              feature.properties.demo_congestion = {
+                level: state.Level,
+                current_speed_mps: state.CurrentSpeedMPS,
+                reference_speed_mps: state.ReferenceSpeedMPS,
+                speed_ratio: state.SpeedRatio,
+                congestion_score: state.CongestionScore,
+                sample_count: state.SampleCount,
+                driver_count: state.DistinctDriverCount
+              };
+            }
+          }
+          renderEdges(distanceKM);
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        edgeCount.textContent += " · " + result.states.length + " congestion states";
+      } catch (cause) {
+        error.textContent = cause.message;
+        error.style.display = "block";
+        edgeCount.textContent = "Tính congestion thất bại";
+      } finally {
+        button.disabled = false;
+        button.textContent = "Tính congestion";
+      }
+    }
+
+    const distancePicker = document.getElementById("distance-km");
+    distancePicker.addEventListener("change", () => {
+      clearTimeout(edgeRequestTimer);
+      const distanceKM = Number(distancePicker.value);
+      if (!distanceKM) {
+        return;
+      }
+      document.getElementById("edge-count").textContent =
+        "Chờ query " + distanceKM + " km";
+      edgeRequestTimer = setTimeout(() => loadEdges(distanceKM), 400);
+    });
+    document.getElementById("congestion-button").addEventListener(
+      "click",
+      calculateCongestion
+    );
   </script>
 </body>
 </html>

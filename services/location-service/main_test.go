@@ -1,13 +1,16 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/gps"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/mapview"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/matching"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/trace"
 )
 
 type fakeGraphEdgeReader struct {
@@ -15,108 +18,108 @@ type fakeGraphEdgeReader struct {
 	err      error
 }
 
-func (reader fakeGraphEdgeReader) ReadBounds(mapview.Bounds, int) (mapview.FeatureCollection, error) {
+func (reader fakeGraphEdgeReader) ReadDistance(
+	mapview.Bounds,
+	float64,
+) (mapview.FeatureCollection, error) {
 	return reader.features, reader.err
 }
 
-func TestGPSEventAccepted(t *testing.T) {
+type fakeStrategy struct {
+	calls int
+}
+
+func (strategy *fakeStrategy) Match(
+	_ context.Context,
+	_ trace.Trace,
+) ([]matching.MatchedObservation, error) {
+	strategy.calls++
+	return nil, nil
+}
+
+func TestGPSEventAliasUsesLocationHandler(t *testing.T) {
+	var receivedPath string
+	locationHandler := http.HandlerFunc(func(
+		responseWriter http.ResponseWriter,
+		request *http.Request,
+	) {
+		receivedPath = request.URL.Path
+		writeJSON(responseWriter, http.StatusOK, map[string]bool{"accepted": true})
+	})
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/gps-events",
-		strings.NewReader(`{
-			"driver_id":"43",
-			"t_timestamp":"55:04.6",
-			"lat":20.988913,
-			"lng":105.941475,
-			"bearing":320.5792,
-			"bearing_acc":-1,
-			"horizontal_acc":2.6855512,
-			"speed":-1,
-			"speed_acc":5.612715,
-			"time_delta":5,
-			"vertical_acc":14.870662,
-			"status":"OFFLINE",
-			"vehicle_type":"car",
-			"time":"7/23/2026 7:55",
-			"timestamp":1.78e12,
-			"altitude":81.4825,
-			"side":null,
-			"delta_time":5.03,
-			"distance":0
-		}`),
+		strings.NewReader(`{"driver_id":"1"}`),
 	)
-	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
-	newHandler(fakeGraphEdgeReader{}).ServeHTTP(response, request)
+	newHandler(fakeGraphEdgeReader{}, locationHandler).
+		ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+		t.Fatalf("status = %d, want 200", response.Code)
 	}
-	if !strings.Contains(response.Body.String(), `"status":"valid"`) {
-		t.Fatalf("unexpected response %s", response.Body.String())
+	if receivedPath != "/locations" {
+		t.Fatalf("aliased path = %q, want /locations", receivedPath)
 	}
-	if strings.Contains(response.Body.String(), `"coverage"`) {
-		t.Fatalf("GPS response must not contain coverage: %s", response.Body.String())
+}
+
+func TestVehicleMatcherSelectsProfile(t *testing.T) {
+	car := &fakeStrategy{}
+	motorcycle := &fakeStrategy{}
+	router := vehicleMatcher{car: car, motorcycle: motorcycle}
+
+	for _, vehicleType := range []string{"car", "bike"} {
+		_, err := router.Match(context.Background(), trace.Trace{
+			Points: []gps.CanonicalEvent{{VehicleType: vehicleType}},
+		})
+		if err != nil {
+			t.Fatalf("Match(%s) error = %v", vehicleType, err)
+		}
+	}
+	if car.calls != 1 || motorcycle.calls != 1 {
+		t.Fatalf("car calls=%d motorcycle calls=%d, want 1 each", car.calls, motorcycle.calls)
 	}
 }
 
 func TestGraphEdgesReturned(t *testing.T) {
 	request := httptest.NewRequest(
 		http.MethodGet,
-		"/v1/graph-edges?bbox=105.84,21.02,105.87,21.04",
+		"/v1/graph-edges?bbox=105.75,20.8,106.1,21.25&distance_km=1000",
 		nil,
 	)
 	response := httptest.NewRecorder()
 	reader := fakeGraphEdgeReader{
 		features: mapview.FeatureCollection{
-			Type:     "FeatureCollection",
-			Features: []mapview.Feature{},
+			Type: "FeatureCollection",
+			Features: []mapview.Feature{
+				{ID: "edge-1", Properties: map[string]any{"edge_id": 1, "distance_m": 12000.0}},
+			},
 		},
 	}
 
-	newHandler(reader).ServeHTTP(response, request)
+	newHandler(reader, nil).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+		t.Fatalf("status = %d, want 200", response.Code)
 	}
 	if !strings.Contains(response.Body.String(), `"type":"FeatureCollection"`) {
 		t.Fatalf("unexpected response %s", response.Body.String())
 	}
 }
 
-func TestGraphEdgesRejectInvalidBounds(t *testing.T) {
+func TestGraphEdgesRequireDistance(t *testing.T) {
 	request := httptest.NewRequest(
 		http.MethodGet,
-		"/v1/graph-edges?bbox=105.87,21.04,105.84,21.02",
+		"/v1/graph-edges?bbox=105.75,20.8,106.1,21.25",
 		nil,
 	)
 	response := httptest.NewRecorder()
 
-	newHandler(fakeGraphEdgeReader{}).ServeHTTP(response, request)
+	newHandler(fakeGraphEdgeReader{}, nil).ServeHTTP(response, request)
 
 	if response.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d: %s", response.Code, response.Body.String())
-	}
-}
-
-func TestDemoCongestionFlowReturned(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/v1/demo/congestion-flow", nil)
-	response := httptest.NewRecorder()
-
-	newHandler(fakeGraphEdgeReader{}).ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
-	}
-	var flow mapview.DemoFlow
-	if err := json.Unmarshal(response.Body.Bytes(), &flow); err != nil {
-		t.Fatal(err)
-	}
-	if flow.TraversalKey != 366218 ||
-		flow.Aggregation.EligibleDriverCount != 2 ||
-		flow.Observations[2].BehaviorState != "BUSINESS_STOP" {
-		t.Fatalf("unexpected demo flow %#v", flow)
+		t.Fatalf("status = %d, want 400", response.Code)
 	}
 }
 
@@ -124,15 +127,22 @@ func TestMapViewReturned(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/map", nil)
 	response := httptest.NewRecorder()
 
-	newHandler(fakeGraphEdgeReader{}).ServeHTTP(response, request)
+	newHandler(fakeGraphEdgeReader{}, nil).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", response.Code)
+		t.Fatalf("status = %d, want 200", response.Code)
 	}
 	if contentType := response.Header().Get("Content-Type"); contentType != "text/html; charset=utf-8" {
 		t.Fatalf("unexpected content type %q", contentType)
 	}
-	if !strings.Contains(response.Body.String(), "<title>Traffic Map View</title>") {
-		t.Fatalf("unexpected map page")
+	if !strings.Contains(response.Body.String(), "function styleCasing") ||
+		!strings.Contains(response.Body.String(), `id="distance-km"`) ||
+		!strings.Contains(response.Body.String(), `id="congestion-button"`) ||
+		!strings.Contains(response.Body.String(), "function calculateCongestion") ||
+		!strings.Contains(response.Body.String(), `value="1000"`) ||
+		!strings.Contains(response.Body.String(), "edgeRequestController") ||
+		!strings.Contains(response.Body.String(), "function annotateDirections") ||
+		!strings.Contains(response.Body.String(), "properties.road_direction") {
+		t.Fatal("map page does not contain the new traffic overlay")
 	}
 }

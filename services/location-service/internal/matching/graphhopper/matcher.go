@@ -18,21 +18,24 @@ import (
 )
 
 type Config struct {
-	BaseURL     string
-	Profile     string
-	GPSAccuracy float64
-	Timeout     time.Duration
+	BaseURL      string
+	Profile      string
+	GraphVersion string
+	GPSAccuracy  float64
+	Timeout      time.Duration
 }
 
 type Matcher struct {
-	endpoint    *url.URL
-	profile     string
-	gpsAccuracy float64
-	client      *http.Client
+	endpoint     *url.URL
+	profile      string
+	graphVersion string
+	gpsAccuracy  float64
+	client       *http.Client
 }
 
 var _ matching.Strategy = (*Matcher)(nil)
 
+// Hàm tạo newmatcher gắn tới /match của graphhopper, với các tham số cấu hình
 func NewMatcher(config Config) (*Matcher, error) {
 	baseURL := strings.TrimRight(
 		strings.TrimSpace(config.BaseURL),
@@ -45,6 +48,10 @@ func NewMatcher(config Config) (*Matcher, error) {
 
 	if strings.TrimSpace(config.Profile) == "" {
 		return nil, fmt.Errorf("GraphHopper profile is required")
+	}
+	graphVersion := strings.TrimSpace(config.GraphVersion)
+	if graphVersion == "" {
+		return nil, fmt.Errorf("GraphHopper graph version is required")
 	}
 
 	if config.GPSAccuracy <= 0 {
@@ -64,9 +71,10 @@ func NewMatcher(config Config) (*Matcher, error) {
 	}
 
 	return &Matcher{
-		endpoint:    endpoint,
-		profile:     strings.TrimSpace(config.Profile),
-		gpsAccuracy: config.GPSAccuracy,
+		endpoint:     endpoint,
+		profile:      strings.TrimSpace(config.Profile),
+		graphVersion: graphVersion,
+		gpsAccuracy:  config.GPSAccuracy,
 		client: &http.Client{
 			Timeout: config.Timeout,
 		},
@@ -132,5 +140,5 @@ func (m *Matcher) Match(
 		return nil, fmt.Errorf("decode GraphHopper response: %w", err)
 	}
 
-	return adaptResponse(input, decoded)
+	return adaptResponse(input, decoded, m.graphVersion)
 }

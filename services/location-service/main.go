@@ -1,4 +1,3 @@
-// Biến kết quả thành HTTP response
 package main
 
 import (
@@ -7,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,45 +14,79 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/eventstream"
-	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/gps"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/httpapi"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/mapview"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/matching"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/matching/graphhopper"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/pipeline"
+	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/trace"
 	"github.com/ColorOfDreams/traffic-system/services/location-service/internal/traffic"
 )
 
-const maxGPSRequestBytes = 64 * 1024
-const maxMapFeatures = 5000
-
 type graphEdgeReader interface {
-	ReadBounds(bounds mapview.Bounds, limit int) (mapview.FeatureCollection, error)
+	ReadDistance(
+		bounds mapview.Bounds,
+		distanceKM float64,
+	) (mapview.FeatureCollection, error)
 }
 
-type gpsPublisher interface {
-	PublishGPS(context.Context, gps.CanonicalEvent) error
+type demoCongestionCalculator interface {
+	Calculate(
+		ctx context.Context,
+		request mapview.CongestionRequest,
+	) (mapview.CongestionResponse, error)
 }
 
 type serviceConfig struct {
-	port                         string
-	tile38Address                string
-	edgeCollections              []string
-	kafkaBrokers                 []string
-	kafkaRawTopic                string
-	kafkaTraceTopic              string
-	kafkaMatchedTopic            string
-	kafkaDeadTopic               string
-	kafkaTraceGroup              string
-	kafkaMatcherGroup            string
-	kafkaCommitEvery             time.Duration
-	graphHopperURL               string
-	graphHopperCarProfile        string
-	graphHopperMotorcycleProfile string
-	graphVersion                 string
-	graphHopperTimeout           time.Duration
-	graphHopperAccuracy          float64
-	graphHopperWorkers           int
-	matchQueueSize               int
-	stateConfig                  gps.ConsumerStateConfig
+	port                string
+	tile38Address       string
+	edgeCollections     []string
+	graphHopperURL      string
+	carProfile          string
+	motorcycleProfile   string
+	graphVersion        string
+	graphHopperTimeout  time.Duration
+	graphHopperAccuracy float64
+	traceConfig         trace.BufferConfig
+	trafficWindow       time.Duration
+	minimumSamples      int
+	minimumDrivers      int
+	fakeGPSPath         string
+}
+
+type vehicleMatcher struct {
+	car        matching.Strategy
+	motorcycle matching.Strategy
+}
+
+func (matcher vehicleMatcher) Match(
+	ctx context.Context,
+	input trace.Trace,
+) ([]matching.MatchedObservation, error) {
+	if len(input.Points) == 0 {
+		return nil, fmt.Errorf("trace points are required")
+	}
+
+	vehicleType := input.Points[0].VehicleType
+	for index, point := range input.Points {
+		if point.VehicleType != vehicleType {
+			return nil, fmt.Errorf(
+				"trace point %d changes vehicle type from %q to %q",
+				index,
+				vehicleType,
+				point.VehicleType,
+			)
+		}
+	}
+
+	switch vehicleType {
+	case "car":
+		return matcher.car.Match(ctx, input)
+	case "bike":
+		return matcher.motorcycle.Match(ctx, input)
+	default:
+		return nil, fmt.Errorf("unsupported vehicle type %q", vehicleType)
+	}
 }
 
 func main() {
@@ -75,192 +107,213 @@ func run() error {
 		return nil
 	}
 
-	stream, err := eventstream.New(eventstream.Config{
-		Brokers:           config.kafkaBrokers,
-		RawTopic:          config.kafkaRawTopic,
-		TraceTopic:        config.kafkaTraceTopic,
-		MatchedTopic:      config.kafkaMatchedTopic,
-		DeadLetterTopic:   config.kafkaDeadTopic,
-		TraceBuilderGroup: config.kafkaTraceGroup,
-		MatcherGroup:      config.kafkaMatcherGroup,
-		Workers:           config.graphHopperWorkers,
-		JobQueueSize:      config.matchQueueSize,
-		MaxMatchAttempts:  config.stateConfig.MaxMatchAttempts,
-		CommitInterval:    config.kafkaCommitEvery,
-		State:             config.stateConfig,
+	carMatcher, err := graphhopper.NewMatcher(graphhopper.Config{
+		BaseURL:      config.graphHopperURL,
+		Profile:      config.carProfile,
+		GraphVersion: config.graphVersion,
+		GPSAccuracy:  config.graphHopperAccuracy,
+		Timeout:      config.graphHopperTimeout,
 	})
+	if err != nil {
+		return fmt.Errorf("create car matcher: %w", err)
+	}
+	motorcycleMatcher, err := graphhopper.NewMatcher(graphhopper.Config{
+		BaseURL:      config.graphHopperURL,
+		Profile:      config.motorcycleProfile,
+		GraphVersion: config.graphVersion,
+		GPSAccuracy:  config.graphHopperAccuracy,
+		Timeout:      config.graphHopperTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("create motorcycle matcher: %w", err)
+	}
+
+	buffer, err := trace.NewBuffer(config.traceConfig)
 	if err != nil {
 		return err
 	}
-	defer stream.Close()
-
-	pingContext, cancelPing := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelPing()
-	if err := stream.Ping(pingContext); err != nil {
-		return err
-	}
-
-	fragmentScope, err := traffic.NewTile38Scope(
-		config.tile38Address,
-		config.edgeCollections,
+	referenceStore := traffic.NewMaxSpeedReferenceStore()
+	processor, err := traffic.NewProcessor(
+		config.trafficWindow,
+		referenceStore,
+		traffic.CalculatorConfig{
+			MinSamples: config.minimumSamples,
+			MinDrivers: config.minimumDrivers,
+		},
 	)
 	if err != nil {
 		return err
 	}
-
-	matcher, err := matching.NewClient(matching.Config{
-		BaseURL:           config.graphHopperURL,
-		CarProfile:        config.graphHopperCarProfile,
-		MotorcycleProfile: config.graphHopperMotorcycleProfile,
-		GraphVersion:      config.graphVersion,
-		GPSAccuracy:       config.graphHopperAccuracy,
-		Timeout:           config.graphHopperTimeout,
-		FragmentScope:     fragmentScope,
-	})
+	matcherRouter := vehicleMatcher{car: carMatcher, motorcycle: motorcycleMatcher}
+	locationPipeline, err := pipeline.New(
+		buffer,
+		matcherRouter,
+		processor,
+	)
+	if err != nil {
+		return err
+	}
+	demoCalculator, err := mapview.NewDemoCongestionCalculator(
+		config.fakeGPSPath,
+		matcherRouter,
+	)
+	if err != nil {
+		return err
+	}
+	locationHandler, err := httpapi.NewHandler(locationPipeline)
 	if err != nil {
 		return err
 	}
 
-	edgeReader := mapview.NewTile38EdgeReader(config.tile38Address, config.edgeCollections)
-	handler := newHandlerWithPublisher(edgeReader, stream)
-
+	edgeReader := mapview.NewTile38EdgeReader(
+		config.tile38Address,
+		config.edgeCollections,
+	)
 	server := &http.Server{
 		Addr:              ":" + config.port,
-		Handler:           handler,
+		Handler:           newHandler(edgeReader, locationHandler, demoCalculator),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 	defer stop()
-
-	streamErrors := make(chan error, 1)
-	go func() {
-		streamErrors <- stream.Run(ctx, matcher)
-	}()
 
 	serverErrors := make(chan error, 1)
 	go func() {
 		serverErrors <- server.ListenAndServe()
 	}()
 
-	var runErr error
 	select {
 	case <-ctx.Done():
-	case err := <-streamErrors:
-		if err != nil {
-			runErr = fmt.Errorf("Kafka consumer stopped: %w", err)
-		}
 	case err := <-serverErrors:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			runErr = fmt.Errorf("HTTP server stopped: %w", err)
+			return fmt.Errorf("HTTP server stopped: %w", err)
 		}
 	}
 
-	stop()
-	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownContext, cancelShutdown := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
 	defer cancelShutdown()
-	if err := server.Shutdown(shutdownContext); err != nil && runErr == nil {
-		runErr = fmt.Errorf("shutdown HTTP server: %w", err)
-	}
-	return runErr
+	return server.Shutdown(shutdownContext)
 }
 
-func newHandler(edgeReader graphEdgeReader) http.Handler {
-	return newHandlerWithPublisher(edgeReader, nil)
-}
-
-func newHandlerWithPublisher(edgeReader graphEdgeReader, publisher gpsPublisher) http.Handler {
+func newHandler(
+	edgeReader graphEdgeReader,
+	locationHandler http.Handler,
+	demoCalculators ...demoCongestionCalculator,
+) http.Handler {
 	mux := http.NewServeMux()
 
-	// POST /v1/gps-events ánh xạ kết quả:
-	// 202: GPS hợp lệ và đã được Kafka xác nhận.
-	// 400: JSON hoặc GPS schema không hợp lệ.
-	// 415: Content-Type không phải application/json.
-	// 503: Kafka tạm thời không nhận được GPS.
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{
+	mux.HandleFunc("GET /health", func(
+		responseWriter http.ResponseWriter,
+		_ *http.Request,
+	) {
+		writeJSON(responseWriter, http.StatusOK, map[string]string{
 			"status":  "ok",
 			"service": "location-service",
 		})
 	})
-	// reqest mẫu :
-	// 	{
-	//   "event_id": "gps-001",
-	//   "driver_id": "1",
-	//   "recorded_at_ms": 1784872804400,
-	//   "longitude": 105.8542,
-	//   "latitude": 21.0285,
-	//   "speed_mps": 9.0,
-	//   "heading_deg": 275,
-	//   "accuracy_m": 3
-	// }
-	// response mẫu :
-	// {
-	//   "status": "valid",
-	//   "event": {
-	//     "event_id": "gps-001",
-	//     "driver_id": "1",
-	//     "recorded_at_ms": 1784872804400,
-	//     "longitude": 105.8542,
-	//     "latitude": 21.0285,
-	//     "speed_mps": 9.0,
-	//     "heading_deg": 275,
-	//     "accuracy_m": 3
-	//   }
-	// }
-	mux.HandleFunc("POST /v1/gps-events", func(w http.ResponseWriter, request *http.Request) {
-		mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-		if err != nil || mediaType != "application/json" {
-			writeAPIError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-			return
-		}
-
-		request.Body = http.MaxBytesReader(w, request.Body, maxGPSRequestBytes)
-		event, err := gps.DecodeCanonicalEvent(request.Body)
-		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_gps_event", err.Error())
-			return
-		}
-
-		// nil chỉ được dùng bởi handler cô lập trong các kiểm tra cũ.
-		if publisher != nil {
-			if err := publisher.PublishGPS(request.Context(), event); err != nil {
-				writeAPIError(w, http.StatusServiceUnavailable, "gps_queue_unavailable", "could not queue GPS event")
-				return
-			}
-			writeJSON(w, http.StatusAccepted, map[string]string{
-				"status":    "queued",
-				"driver_id": event.DriverID,
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "valid",
-			"event":  event,
+	if locationHandler != nil {
+		mux.Handle("POST /locations", locationHandler)
+		mux.Handle("GET /healthz", locationHandler)
+		mux.HandleFunc("POST /v1/gps-events", func(
+			responseWriter http.ResponseWriter,
+			request *http.Request,
+		) {
+			aliasedRequest := request.Clone(request.Context())
+			aliasedRequest.URL.Path = "/locations"
+			locationHandler.ServeHTTP(responseWriter, aliasedRequest)
 		})
-	})
-	mux.HandleFunc("GET /v1/graph-edges", func(w http.ResponseWriter, request *http.Request) {
+	}
+	mux.HandleFunc("GET /v1/graph-edges", func(
+		responseWriter http.ResponseWriter,
+		request *http.Request,
+	) {
 		bounds, err := parseBounds(request.URL.Query().Get("bbox"))
 		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_bbox", err.Error())
+			writeAPIError(
+				responseWriter,
+				http.StatusBadRequest,
+				"invalid_bbox",
+				err.Error(),
+			)
+			return
+		}
+		distanceKM, err := parseDistanceKM(
+			request.URL.Query().Get("distance_km"),
+		)
+		if err != nil {
+			writeAPIError(
+				responseWriter,
+				http.StatusBadRequest,
+				"invalid_distance_km",
+				err.Error(),
+			)
 			return
 		}
 
-		features, err := edgeReader.ReadBounds(bounds, maxMapFeatures)
+		features, err := edgeReader.ReadDistance(bounds, distanceKM)
 		if err != nil {
-			writeAPIError(w, http.StatusServiceUnavailable, "graph_edges_unavailable", "could not read graph edges")
+			writeAPIError(
+				responseWriter,
+				http.StatusServiceUnavailable,
+				"graph_edges_unavailable",
+				"could not read graph edges",
+			)
 			return
 		}
-		writeJSON(w, http.StatusOK, features)
+		writeJSON(responseWriter, http.StatusOK, features)
 	})
-	mux.HandleFunc("GET /v1/demo/congestion-flow", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, mapview.NewDemoFlow(time.Now()))
+	if len(demoCalculators) > 0 && demoCalculators[0] != nil {
+		demoCalculator := demoCalculators[0]
+		mux.HandleFunc("POST /v1/demo/congestion", func(
+			responseWriter http.ResponseWriter,
+			request *http.Request,
+		) {
+			request.Body = http.MaxBytesReader(responseWriter, request.Body, 1<<20)
+			var input mapview.CongestionRequest
+			decoder := json.NewDecoder(request.Body)
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&input); err != nil {
+				writeAPIError(responseWriter, http.StatusBadRequest, "invalid_request", err.Error())
+				return
+			}
+			result, err := demoCalculator.Calculate(request.Context(), input)
+			if err != nil {
+				writeAPIError(
+					responseWriter,
+					http.StatusUnprocessableEntity,
+					"congestion_calculation_failed",
+					err.Error(),
+				)
+				return
+			}
+			writeJSON(responseWriter, http.StatusOK, result)
+		})
+	}
+	mux.HandleFunc("GET /map", func(
+		responseWriter http.ResponseWriter,
+		_ *http.Request,
+	) {
+		responseWriter.Header().Set("Content-Type", "text/html; charset=utf-8")
+		responseWriter.WriteHeader(http.StatusOK)
+		_, _ = responseWriter.Write(mapview.Page())
 	})
-	mux.HandleFunc("GET /map", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(mapview.Page())
+	mux.HandleFunc("GET /", func(
+		responseWriter http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.URL.Path != "/" {
+			http.NotFound(responseWriter, request)
+			return
+		}
+		http.Redirect(responseWriter, request, "/map", http.StatusTemporaryRedirect)
 	})
 	return mux
 }
@@ -268,7 +321,9 @@ func newHandlerWithPublisher(edgeReader graphEdgeReader, publisher gpsPublisher)
 func parseBounds(value string) (mapview.Bounds, error) {
 	parts := strings.Split(value, ",")
 	if len(parts) != 4 {
-		return mapview.Bounds{}, fmt.Errorf("bbox must contain minLon,minLat,maxLon,maxLat")
+		return mapview.Bounds{}, fmt.Errorf(
+			"bbox must contain minLon,minLat,maxLon,maxLat",
+		)
 	}
 
 	coordinates := make([]float64, 4)
@@ -290,98 +345,96 @@ func parseBounds(value string) (mapview.Bounds, error) {
 		bounds.MinLatitude < -90 || bounds.MaxLatitude > 90 ||
 		bounds.MinLongitude >= bounds.MaxLongitude ||
 		bounds.MinLatitude >= bounds.MaxLatitude {
-		return mapview.Bounds{}, fmt.Errorf("bbox is outside valid coordinate ranges or has reversed bounds")
+		return mapview.Bounds{}, fmt.Errorf(
+			"bbox is outside valid coordinate ranges or has reversed bounds",
+		)
 	}
 	return bounds, nil
 }
 
-// load config kiểm tra
+func parseDistanceKM(value string) (float64, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("distance_km is required")
+	}
+	distanceKM, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(distanceKM) || math.IsInf(distanceKM, 0) {
+		return 0, fmt.Errorf("distance_km must be a number")
+	}
+	if distanceKM < 0.1 || distanceKM > 1000 {
+		return 0, fmt.Errorf("distance_km must be from 0.1 to 1000")
+	}
+	return distanceKM, nil
+}
+
 func loadConfig() (serviceConfig, error) {
 	config := serviceConfig{
-		port:                         envOrDefault("PORT", "8080"),
-		tile38Address:                envOrDefault("TILE38_ADDRESS", "tile38:9851"),
-		kafkaBrokers:                 splitNonEmpty(envOrDefault("KAFKA_BROKERS", "kafka:29092")),
-		kafkaRawTopic:                envOrDefault("KAFKA_RAW_TOPIC", "gps.raw"),
-		kafkaTraceTopic:              envOrDefault("KAFKA_TRACE_TOPIC", "gps.traces"),
-		kafkaMatchedTopic:            envOrDefault("KAFKA_MATCHED_TOPIC", "gps.matched"),
-		kafkaDeadTopic:               envOrDefault("KAFKA_DEAD_LETTER_TOPIC", "gps.dead-letter"),
-		kafkaTraceGroup:              envOrDefault("KAFKA_TRACE_BUILDER_GROUP", "location-trace-builder-v1"),
-		kafkaMatcherGroup:            envOrDefault("KAFKA_MATCHER_GROUP", "location-map-matching-v2"),
-		graphHopperURL:               envOrDefault("GRAPHHOPPER_URL", "http://graphhopper:8989"),
-		graphHopperCarProfile:        envOrDefault("GRAPHHOPPER_CAR_PROFILE", "car"),
-		graphHopperMotorcycleProfile: envOrDefault("GRAPHHOPPER_MOTORCYCLE_PROFILE", "motorcycle"),
-		graphVersion:                 envOrDefault("GRAPH_VERSION", "vietnam-20260730-motorcycle-v1"),
-		edgeCollections: splitNonEmpty(
-			envOrDefault(
-				"GPS_EDGE_COLLECTIONS",
-				"hanoi_graph_edges_vietnam_20260730_motorcycle_v1,hochiminh_graph_edges_vietnam_20260730_motorcycle_v1",
-			),
-		),
+		port:              envOrDefault("PORT", "8080"),
+		tile38Address:     envOrDefault("TILE38_ADDRESS", "tile38:9851"),
+		graphHopperURL:    envOrDefault("GRAPHHOPPER_URL", "http://graphhopper:8989"),
+		carProfile:        envOrDefault("GRAPHHOPPER_CAR_PROFILE", "car"),
+		motorcycleProfile: envOrDefault("GRAPHHOPPER_MOTORCYCLE_PROFILE", "motorcycle"),
+		graphVersion:      envOrDefault("GRAPH_VERSION", "vietnam-20260730-motorcycle-v1"),
+		fakeGPSPath:       envOrDefault("FAKE_GPS_PATH", "/data/gps-fake/fake_gps.csv"),
+		edgeCollections: splitNonEmpty(envOrDefault(
+			"GPS_EDGE_COLLECTIONS",
+			"hanoi_graph_edges_vietnam_20260730_motorcycle_v1,"+
+				"hochiminh_graph_edges_vietnam_20260730_motorcycle_v1",
+		)),
 	}
+
 	var err error
-
-	config.kafkaCommitEvery, err = durationFromEnv("KAFKA_COMMIT_INTERVAL", time.Second)
+	config.graphHopperTimeout, err = durationFromEnv(
+		"GRAPHHOPPER_TIMEOUT",
+		5*time.Second,
+	)
 	if err != nil {
 		return serviceConfig{}, err
 	}
-	config.graphHopperTimeout, err = durationFromEnv("GRAPHHOPPER_TIMEOUT", 5*time.Second)
+	config.graphHopperAccuracy, err = floatFromEnv(
+		"GRAPHHOPPER_GPS_ACCURACY",
+		10,
+	)
+	if err != nil || config.graphHopperAccuracy <= 0 {
+		return serviceConfig{}, fmt.Errorf("GRAPHHOPPER_GPS_ACCURACY must be positive")
+	}
+	config.traceConfig.MaxPoints, err = intFromEnv("TRACE_POINTS", 5)
 	if err != nil {
 		return serviceConfig{}, err
 	}
-	config.graphHopperAccuracy, err = floatFromEnv("GRAPHHOPPER_GPS_ACCURACY", 10)
+	config.traceConfig.MinPoints, err = intFromEnv("TRACE_MIN_POINTS", 2)
 	if err != nil {
 		return serviceConfig{}, err
 	}
-	config.graphHopperWorkers, err = intFromEnv("GRAPHHOPPER_WORKERS", 4)
+	config.traceConfig.OverlapPoints, err = intFromEnv("TRACE_OVERLAP_POINTS", 2)
 	if err != nil {
 		return serviceConfig{}, err
 	}
-	config.matchQueueSize, err = intFromEnv("MATCH_QUEUE_SIZE", 64)
+	config.traceConfig.MaxDuration, err = durationFromEnv(
+		"TRACE_MAX_DURATION",
+		30*time.Second,
+	)
 	if err != nil {
 		return serviceConfig{}, err
 	}
-
-	config.stateConfig.TracePoints, err = intFromEnv("TRACE_POINTS", 5)
+	config.trafficWindow, err = durationFromEnv("TRAFFIC_WINDOW", 10*time.Second)
 	if err != nil {
 		return serviceConfig{}, err
 	}
-	config.stateConfig.OverlapPoints, err = intFromEnv("TRACE_OVERLAP_POINTS", 2)
-	if err != nil {
-		return serviceConfig{}, err
+	config.minimumSamples, err = intFromEnv("TRAFFIC_MIN_SAMPLES", 1)
+	if err != nil || config.minimumSamples < 1 {
+		return serviceConfig{}, fmt.Errorf("TRAFFIC_MIN_SAMPLES must be positive")
 	}
-	config.stateConfig.MaxPointGap, err = durationFromEnv("TRACE_MAX_POINT_GAP", 20*time.Second)
-	if err != nil {
-		return serviceConfig{}, err
+	config.minimumDrivers, err = intFromEnv("TRAFFIC_MIN_DRIVERS", 1)
+	if err != nil || config.minimumDrivers < 1 {
+		return serviceConfig{}, fmt.Errorf("TRAFFIC_MIN_DRIVERS must be positive")
 	}
-	config.stateConfig.InactivityTimeout, err = durationFromEnv("DRIVER_INACTIVITY_TIMEOUT", 2*time.Minute)
-	if err != nil {
-		return serviceConfig{}, err
-	}
-	config.stateConfig.MaxBufferedPoints, err = intFromEnv("DRIVER_MAX_BUFFERED_POINTS", 20)
-	if err != nil {
-		return serviceConfig{}, err
-	}
-	config.stateConfig.MaxMatchAttempts, err = intFromEnv("MATCH_MAX_ATTEMPTS", 3)
-	if err != nil {
-		return serviceConfig{}, err
-	}
-	config.stateConfig.MinDisplacementM, err = floatFromEnv("TRACE_MIN_DISPLACEMENT_METERS", 10)
-	if err != nil {
-		return serviceConfig{}, err
-	}
-	config.stateConfig.MaxImpliedSpeedMPS, err = floatFromEnv("TRACE_MAX_IMPLIED_SPEED_MPS", 70)
-	if err != nil {
-		return serviceConfig{}, err
-	}
-
 	if len(config.edgeCollections) == 0 {
-		return serviceConfig{}, fmt.Errorf("GPS_EDGE_COLLECTIONS must contain at least one collection")
+		return serviceConfig{}, fmt.Errorf(
+			"GPS_EDGE_COLLECTIONS must contain at least one collection",
+		)
 	}
-	if len(config.kafkaBrokers) == 0 {
-		return serviceConfig{}, fmt.Errorf("KAFKA_BROKERS must contain at least one broker")
-	}
-	if _, err := gps.NewConsumerState(config.stateConfig); err != nil {
-		return serviceConfig{}, fmt.Errorf("invalid consumer state config: %w", err)
+	if err := config.traceConfig.Validate(); err != nil {
+		return serviceConfig{}, fmt.Errorf("invalid trace config: %w", err)
 	}
 	return config, nil
 }
@@ -414,7 +467,10 @@ func intFromEnv(name string, fallback int) (int, error) {
 }
 
 func floatFromEnv(name string, fallback float64) (float64, error) {
-	value := envOrDefault(name, strconv.FormatFloat(fallback, 'f', -1, 64))
+	value := envOrDefault(
+		name,
+		strconv.FormatFloat(fallback, 'f', -1, 64),
+	)
 	number, err := strconv.ParseFloat(value, 64)
 	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
 		return 0, fmt.Errorf("%s must be a finite number", name)
@@ -422,17 +478,29 @@ func floatFromEnv(name string, fallback float64) (float64, error) {
 	return number, nil
 }
 
-func durationFromEnv(name string, fallback time.Duration) (time.Duration, error) {
+func durationFromEnv(
+	name string,
+	fallback time.Duration,
+) (time.Duration, error) {
 	value := envOrDefault(name, fallback.String())
 	duration, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, fmt.Errorf("%s must be a Go duration such as 5s or 2m: %w", name, err)
+		return 0, fmt.Errorf(
+			"%s must be a Go duration such as 5s or 2m: %w",
+			name,
+			err,
+		)
 	}
 	return duration, nil
 }
 
-func writeAPIError(w http.ResponseWriter, status int, code string, message string) {
-	writeJSON(w, status, map[string]any{
+func writeAPIError(
+	responseWriter http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	writeJSON(responseWriter, status, map[string]any{
 		"error": map[string]string{
 			"code":    code,
 			"message": message,
@@ -440,10 +508,14 @@ func writeAPIError(w http.ResponseWriter, status int, code string, message strin
 	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+func writeJSON(
+	responseWriter http.ResponseWriter,
+	status int,
+	value any,
+) {
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(status)
+	_ = json.NewEncoder(responseWriter).Encode(value)
 }
 
 func checkHealth(port string) {
@@ -453,7 +525,6 @@ func checkHealth(port string) {
 		os.Exit(1)
 	}
 	defer response.Body.Close()
-
 	if response.StatusCode != http.StatusOK {
 		os.Exit(1)
 	}

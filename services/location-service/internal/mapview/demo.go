@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const demoTraversalKey int64 = 366218
+const demoTraversalKey int64 = 11916856
 
 type DemoFlow struct {
 	TraceID      string            `json:"trace_id"`
@@ -41,34 +41,34 @@ type DemoAggregation struct {
 func NewDemoFlow(now time.Time) DemoFlow {
 	observations := []DemoObservation{
 		{
-			DriverID:       "driver-101",
-			PointIndex:     1,
-			Latitude:       11.49208,
-			Longitude:      106.49915,
-			SpeedMPS:       2.2,
-			BehaviorState:  "TRAFFIC_WAIT",
-			Eligible:       true,
-			DecisionReason: "Xe vẫn IN_TRIP và nhiều xe cùng traversal đều chậm.",
-		},
-		{
-			DriverID:       "driver-205",
-			PointIndex:     1,
-			Latitude:       11.49252,
-			Longitude:      106.49963,
-			SpeedMPS:       3.0,
-			BehaviorState:  "TRAFFIC_WAIT",
-			Eligible:       true,
-			DecisionReason: "Observation phù hợp dòng xe đang di chuyển chậm.",
-		},
-		{
-			DriverID:       "driver-309",
-			PointIndex:     1,
-			Latitude:       11.4923234,
-			Longitude:      106.4994076,
+			DriverID:       "1",
+			PointIndex:     0,
+			Latitude:       10.778242,
+			Longitude:      106.701935,
 			SpeedMPS:       0,
-			BehaviorState:  "BUSINESS_STOP",
+			BehaviorState:  "TRAFFIC_WAIT",
+			Eligible:       true,
+			DecisionReason: "IN TRIP, matched vào tertiary traversal 11916856; giữ speed=0.",
+		},
+		{
+			DriverID:       "1",
+			PointIndex:     5,
+			Latitude:       10.778357,
+			Longitude:      106.70176,
+			SpeedMPS:       2.2753384,
+			BehaviorState:  "ROAD_CLASS_FILTERED",
 			Eligible:       false,
-			DecisionReason: "Status transition xác nhận dừng đón/trả khách.",
+			DecisionReason: "GraphHopper match vào road_class=service nên không tính traffic.",
+		},
+		{
+			DriverID:       "1",
+			PointIndex:     8,
+			Latitude:       10.778379,
+			Longitude:      106.70173,
+			SpeedMPS:       0.06876571,
+			BehaviorState:  "ROAD_CLASS_FILTERED",
+			Eligible:       false,
+			DecisionReason: "GraphHopper match vào road_class=service nên không tính traffic.",
 		},
 	}
 	referenceSpeed := 10.0
@@ -76,20 +76,20 @@ func NewDemoFlow(now time.Time) DemoFlow {
 	ratio := currentSpeed / referenceSpeed
 
 	return DemoFlow{
-		TraceID:      "demo-hcm-secondary-001",
+		TraceID:      "fake-gps-driver-1-20260724-0210",
 		VehicleType:  "motorcycle",
 		TraversalKey: demoTraversalKey,
-		RoadClass:    "secondary",
+		RoadClass:    "tertiary",
 		GeneratedAt:  now.UTC(),
 		Observations: observations,
 		Aggregation: DemoAggregation{
-			EligibleDriverCount: 2,
-			TotalDriverCount:    len(observations),
+			EligibleDriverCount: 1,
+			TotalDriverCount:    1,
 			CurrentSpeedMPS:     currentSpeed,
 			ReferenceSpeedMPS:   referenceSpeed,
 			SpeedRatio:          ratio,
 			CongestionScore:     1 - ratio,
-			Level:               "SEVERE",
+			Level:               "CONGESTED",
 		},
 	}
 }

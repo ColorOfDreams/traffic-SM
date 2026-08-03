@@ -73,3 +73,14 @@ func TestDirectedFeaturesUseTile38ObjectIdentity(t *testing.T) {
 		t.Fatalf("unexpected directed feature identities %#v", features)
 	}
 }
+
+func TestNumericTile38Properties(t *testing.T) {
+	edgeID, ok := numericPropertyText(json.Number("5958428"))
+	if !ok || edgeID != "5958428" {
+		t.Fatalf("edge ID = %q, %v", edgeID, ok)
+	}
+	distance, ok := numericPropertyFloat(json.Number("71.898"))
+	if !ok || distance != 71.898 {
+		t.Fatalf("distance = %v, %v", distance, ok)
+	}
+}

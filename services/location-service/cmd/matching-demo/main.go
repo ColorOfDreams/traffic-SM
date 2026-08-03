@@ -14,10 +14,11 @@ import (
 
 func main() {
 	matcher, err := graphhopper.NewMatcher(graphhopper.Config{
-		BaseURL:     "http://localhost:8989",
-		Profile:     "car",
-		GPSAccuracy: 20,
-		Timeout:     10 * time.Second,
+		BaseURL:      "http://localhost:8989",
+		Profile:      "car",
+		GraphVersion: "vietnam-20260730-motorcycle-v1",
+		GPSAccuracy:  20,
+		Timeout:      10 * time.Second,
 	})
 	if err != nil {
 		log.Fatal(err)

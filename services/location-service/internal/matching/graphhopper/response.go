@@ -5,10 +5,9 @@ type matchResponse struct {
 }
 
 type matchedPointResponse struct {
-	PointIndex    int      `json:"point_index"`
-	Matched       bool     `json:"matched"`
-	TraversalKey  *int64   `json:"traversal_key"`
-	SnappedLat    *float64 `json:"snapped_lat"`
-	SnappedLon    *float64 `json:"snapped_lon"`
-	SnapDistanceM *float64 `json:"snap_distance_m"`
+	PointIndex         int      `json:"point_index"`
+	Matched            bool     `json:"matched"`
+	EligibleForTraffic *bool    `json:"eligible_for_traffic"`
+	TraversalKey       *int64   `json:"traversal_key"`
+	MaxSpeedKMH        *float64 `json:"max_speed_kmh"`
 }
